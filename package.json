@@ -1,4 +1,4 @@
-//package.json pour stripe-backend 
+
 {
   "name": "stripe-paypal-backend",
   "version": "1.0.0",
