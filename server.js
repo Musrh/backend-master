@@ -27,11 +27,10 @@ const db = admin.firestore();
 // ================= STRIPE =================
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// ================= FRONTEND SAAS =================
+// ================= FRONTEND =================
 const FRONTEND_URL = "https://musrh.github.io/SaasBuilder";
 
-// ================= WEBHOOK STRIPE =================
-// ⚠️ IMPORTANT: raw body must be before express.json()
+// ================= WEBHOOK =================
 app.post(
   "/webhook",
   bodyParser.raw({ type: "application/json" }),
@@ -60,7 +59,7 @@ app.post(
 
       if (session.payment_status === "paid") {
 
-        // 🔐 anti doublon
+        // 🔐 Anti doublon
         const existing = await db
           .collection("orders")
           .where("sessionId", "==", session.id)
@@ -82,7 +81,7 @@ app.post(
           console.log("⚠️ metadata parse error");
         }
 
-        // ================= FIRESTORE SAVE =================
+        // ================= SAVE FIRESTORE =================
         await db.collection("orders").doc(session.id).set({
           email: session.customer_email || metadata.email || "",
           items: metadata.items || [],
@@ -96,7 +95,7 @@ app.post(
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        console.log("✅ Order saved with sessionId doc");
+        console.log("✅ Order saved:", session.id);
       }
     }
 
@@ -104,10 +103,10 @@ app.post(
   }
 );
 
-// ================= JSON MIDDLEWARE =================
+// ================= JSON =================
 app.use(express.json());
 
-// ================= CREATE STRIPE SESSION =================
+// ================= CREATE SESSION =================
 app.post("/create-stripe-session", async (req, res) => {
   try {
     const {
@@ -117,6 +116,15 @@ app.post("/create-stripe-session", async (req, res) => {
       clientId,
       plan
     } = req.body;
+
+    const finalPlan = plan || "basic";
+
+    // 🔥 URL dynamique avec plan
+    const successUrl =
+      `${FRONTEND_URL}/#/success?plan=${finalPlan}&session_id={CHECKOUT_SESSION_ID}`;
+
+    const cancelUrl =
+      `${FRONTEND_URL}/#/cancel`;
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -135,24 +143,21 @@ app.post("/create-stripe-session", async (req, res) => {
 
       mode: "payment",
 
-      // ================= SAAS FRONTEND =================
-      success_url:
-        `${FRONTEND_URL}/#/success?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
 
-      cancel_url:
-        `${FRONTEND_URL}/#/cancel`,
-
-      // ================= METADATA SAAS =================
       metadata: {
         data: JSON.stringify({
           items,
           adresseLivraison,
           email,
           clientId: clientId || "master",
-          plan: plan || "basic",
+          plan: finalPlan,
         }),
       },
     });
+
+    console.log("🧾 Session créée:", session.id, "Plan:", finalPlan);
 
     res.json({ url: session.url });
 
@@ -162,7 +167,7 @@ app.post("/create-stripe-session", async (req, res) => {
   }
 });
 
-// ================= HEALTH CHECK =================
+// ================= HEALTH =================
 app.get("/", (req, res) => {
   res.json({
     status: "OK",
@@ -172,11 +177,10 @@ app.get("/", (req, res) => {
   });
 });
 
-// ================= START SERVER =================
+// ================= START =================
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
   console.log("🚀 SaaS Master running on port", PORT);
   console.log("🌍 Frontend:", FRONTEND_URL);
-  console.log("⚡ Backend ready:", "https://backend-master-production-cf50.up.railway.app");
 });
