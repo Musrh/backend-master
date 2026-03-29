@@ -95,6 +95,15 @@ app.post(
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
+        await db.collection("sites").doc(uid).set({
+  userId: uid,
+  plan: "premium",
+  sections: [
+    { type: "hero", title: "Bienvenue" },
+    { type: "text", content: "Mon site SaaS" }
+  ]
+});
+
         console.log("✅ Order saved:", session.id);
       }
     }
