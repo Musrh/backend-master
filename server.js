@@ -17,7 +17,7 @@ app.use(cors({
 }));
 
 // ================= FIREBASE SAFE INIT =================
-let serviceAccount;
+let serviceAccount = null;
 
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -25,9 +25,13 @@ try {
   console.error("❌ Firebase service account JSON invalide");
 }
 
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+if (serviceAccount) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+} else {
+  console.error("❌ Firebase NON initialisé");
+}
 
 const db = admin.firestore();
 
@@ -39,6 +43,14 @@ const FRONTEND_URL = "https://musrh.github.io/SaasBuilder";
 
 // ================= JSON =================
 app.use(express.json());
+
+// ================= DEBUG (IMPORTANT) =================
+app.use((req, res, next) => {
+  if (req.path === "/create-stripe-session") {
+    console.log("📦 BODY REÇU =", req.body);
+  }
+  next();
+});
 
 // ================= WEBHOOK STRIPE =================
 app.post(
@@ -68,7 +80,6 @@ app.post(
 
       if (session.payment_status === "paid") {
         try {
-          // 🔐 anti doublon
           const existing = await db
             .collection("orders")
             .where("sessionId", "==", session.id)
@@ -79,7 +90,7 @@ app.post(
             return res.json({ received: true });
           }
 
-          // ================= METADATA =================
+          // ================= METADATA SAFE =================
           let metadata = {};
 
           try {
@@ -87,16 +98,16 @@ app.post(
               ? JSON.parse(session.metadata.data)
               : {};
           } catch (e) {
-            console.log("⚠️ Erreur parsing metadata");
+            console.log("⚠️ Metadata invalide");
           }
 
           const uid = metadata.clientId || "master";
 
-          // ================= SAVE ORDER =================
+          // ================= ORDER =================
           await db.collection("orders").doc(session.id).set({
             email: session.customer_email || metadata.email || "",
             items: metadata.items || [],
-            montant: session.amount_total / 100,
+            montant: (session.amount_total || 0) / 100,
             adresse: metadata.adresseLivraison || "",
             clientId: uid,
             plan: metadata.plan || "basic",
@@ -106,7 +117,7 @@ app.post(
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
-          // ================= SAVE SITE =================
+          // ================= SITE =================
           await db.collection("sites").doc(uid).set({
             userId: uid,
             plan: metadata.plan || "premium",
@@ -117,10 +128,10 @@ app.post(
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           }, { merge: true });
 
-          console.log("✅ Order + Site sauvegardés:", session.id);
+          console.log("✅ ORDER + SITE OK:", session.id);
 
         } catch (err) {
-          console.error("❌ Erreur webhook processing:", err);
+          console.error("❌ Webhook error:", err);
         }
       }
     }
@@ -132,26 +143,20 @@ app.post(
 // ================= CREATE STRIPE SESSION =================
 app.post("/create-stripe-session", async (req, res) => {
   try {
-    const {
-      items,
-      email,
-      adresseLivraison,
-      clientId,
-      plan
-    } = req.body;
+    let { items, email, adresseLivraison, clientId, plan } = req.body;
 
-    // 🔥 VALIDATION PANIER
-    if (!items || !items.length) {
+    // ================= NORMALISATION PANIER =================
+    items = (items || []).map((item) => ({
+      nom: item.nom || item.title || "Produit",
+      prix: item.prix || item.price || 0,
+      quantity: item.quantity || item.qty || 1,
+    }));
+
+    if (!items.length) {
       return res.status(400).json({ error: "Panier vide" });
     }
 
     const finalPlan = plan || "basic";
-
-    const successUrl =
-      `${FRONTEND_URL}/#/success?plan=${finalPlan}&session_id={CHECKOUT_SESSION_ID}`;
-
-    const cancelUrl =
-      `${FRONTEND_URL}/#/cancel`;
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -161,17 +166,20 @@ app.post("/create-stripe-session", async (req, res) => {
         price_data: {
           currency: "eur",
           product_data: {
-            name: item.nom || "Produit",
+            name: item.nom,
           },
-          unit_amount: Math.round((item.prix || 0) * 100),
+          unit_amount: Math.round(item.prix * 100),
         },
-        quantity: item.quantity || 1,
+        quantity: item.quantity,
       })),
 
       mode: "payment",
 
-      success_url: successUrl,
-      cancel_url: cancelUrl,
+      success_url:
+        `${FRONTEND_URL}/#/success?plan=${finalPlan}&session_id={CHECKOUT_SESSION_ID}`,
+
+      cancel_url:
+        `${FRONTEND_URL}/#/cancel`,
 
       metadata: {
         data: JSON.stringify({
@@ -184,7 +192,7 @@ app.post("/create-stripe-session", async (req, res) => {
       },
     });
 
-    console.log("🧾 Session Stripe créée:", session.id);
+    console.log("🧾 Stripe session OK:", session.id);
 
     res.json({ url: session.url });
 
@@ -192,25 +200,23 @@ app.post("/create-stripe-session", async (req, res) => {
     console.error("❌ Stripe session error:", err);
     res.status(500).json({
       error: "Stripe session failed",
-      details: err.message
+      details: err.message,
     });
   }
 });
 
-// ================= HEALTH CHECK =================
+// ================= HEALTH =================
 app.get("/", (req, res) => {
   res.json({
     status: "OK",
     service: "SaaS Master Backend",
     frontend: FRONTEND_URL,
-    backend: "https://backend-master-production-cf50.up.railway.app"
   });
 });
 
-// ================= START SERVER =================
+// ================= START =================
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
   console.log("🚀 SaaS Master running on port", PORT);
-  console.log("🌍 Frontend:", FRONTEND_URL);
 });
