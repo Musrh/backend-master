@@ -1,3 +1,4 @@
+// ================= BACKEND MASTER =================
 import express from "express";
 import cors from "cors";
 import Stripe from "stripe";
@@ -15,8 +16,14 @@ app.use(cors({
   methods: ["GET", "POST"],
 }));
 
-// ================= FIREBASE =================
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+// ================= FIREBASE SAFE INIT =================
+let serviceAccount;
+
+try {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} catch (e) {
+  console.error("❌ Firebase service account JSON invalide");
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -30,12 +37,14 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 // ================= FRONTEND =================
 const FRONTEND_URL = "https://musrh.github.io/SaasBuilder";
 
-// ================= WEBHOOK =================
+// ================= JSON =================
+app.use(express.json());
+
+// ================= WEBHOOK STRIPE =================
 app.post(
   "/webhook",
   bodyParser.raw({ type: "application/json" }),
   async (req, res) => {
-
     const sig = req.headers["stripe-signature"];
 
     let event;
@@ -58,53 +67,61 @@ app.post(
       console.log("💰 PAYMENT SUCCESS:", session.id);
 
       if (session.payment_status === "paid") {
-
-        // 🔐 Anti doublon
-        const existing = await db
-          .collection("orders")
-          .where("sessionId", "==", session.id)
-          .get();
-
-        if (!existing.empty) {
-          console.log("⚠️ Order already exists");
-          return res.json({ received: true });
-        }
-
-        // ================= METADATA =================
-        let metadata = {};
-
         try {
-          metadata = session.metadata?.data
-            ? JSON.parse(session.metadata.data)
-            : {};
-        } catch (e) {
-          console.log("⚠️ metadata parse error");
+          // 🔐 anti doublon
+          const existing = await db
+            .collection("orders")
+            .where("sessionId", "==", session.id)
+            .get();
+
+          if (!existing.empty) {
+            console.log("⚠️ Order déjà existante");
+            return res.json({ received: true });
+          }
+
+          // ================= METADATA =================
+          let metadata = {};
+
+          try {
+            metadata = session.metadata?.data
+              ? JSON.parse(session.metadata.data)
+              : {};
+          } catch (e) {
+            console.log("⚠️ Erreur parsing metadata");
+          }
+
+          const uid = metadata.clientId || "master";
+
+          // ================= SAVE ORDER =================
+          await db.collection("orders").doc(session.id).set({
+            email: session.customer_email || metadata.email || "",
+            items: metadata.items || [],
+            montant: session.amount_total / 100,
+            adresse: metadata.adresseLivraison || "",
+            clientId: uid,
+            plan: metadata.plan || "basic",
+            paymentMethod: "stripe",
+            sessionId: session.id,
+            status: "paid",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          // ================= SAVE SITE =================
+          await db.collection("sites").doc(uid).set({
+            userId: uid,
+            plan: metadata.plan || "premium",
+            sections: [
+              { type: "hero", title: "Bienvenue" },
+              { type: "text", content: "Mon site SaaS" }
+            ],
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+
+          console.log("✅ Order + Site sauvegardés:", session.id);
+
+        } catch (err) {
+          console.error("❌ Erreur webhook processing:", err);
         }
-
-        // ================= SAVE FIRESTORE =================
-        await db.collection("orders").doc(session.id).set({
-          email: session.customer_email || metadata.email || "",
-          items: metadata.items || [],
-          montant: session.amount_total / 100,
-          adresse: metadata.adresseLivraison || "",
-          clientId: metadata.clientId || "master",
-          plan: metadata.plan || "basic",
-          paymentMethod: "stripe",
-          sessionId: session.id,
-          status: "paid",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        await db.collection("sites").doc(uid).set({
-  userId: uid,
-  plan: "premium",
-  sections: [
-    { type: "hero", title: "Bienvenue" },
-    { type: "text", content: "Mon site SaaS" }
-  ]
-});
-
-        console.log("✅ Order saved:", session.id);
       }
     }
 
@@ -112,10 +129,7 @@ app.post(
   }
 );
 
-// ================= JSON =================
-app.use(express.json());
-
-// ================= CREATE SESSION =================
+// ================= CREATE STRIPE SESSION =================
 app.post("/create-stripe-session", async (req, res) => {
   try {
     const {
@@ -126,9 +140,13 @@ app.post("/create-stripe-session", async (req, res) => {
       plan
     } = req.body;
 
+    // 🔥 VALIDATION PANIER
+    if (!items || !items.length) {
+      return res.status(400).json({ error: "Panier vide" });
+    }
+
     const finalPlan = plan || "basic";
 
-    // 🔥 URL dynamique avec plan
     const successUrl =
       `${FRONTEND_URL}/#/success?plan=${finalPlan}&session_id={CHECKOUT_SESSION_ID}`;
 
@@ -137,17 +155,17 @@ app.post("/create-stripe-session", async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
-      customer_email: email,
+      customer_email: email || undefined,
 
       line_items: items.map((item) => ({
         price_data: {
           currency: "eur",
           product_data: {
-            name: item.nom,
+            name: item.nom || "Produit",
           },
-          unit_amount: Math.round(item.prix * 100),
+          unit_amount: Math.round((item.prix || 0) * 100),
         },
-        quantity: item.quantity,
+        quantity: item.quantity || 1,
       })),
 
       mode: "payment",
@@ -158,25 +176,28 @@ app.post("/create-stripe-session", async (req, res) => {
       metadata: {
         data: JSON.stringify({
           items,
-          adresseLivraison,
-          email,
+          adresseLivraison: adresseLivraison || "",
+          email: email || "",
           clientId: clientId || "master",
           plan: finalPlan,
         }),
       },
     });
 
-    console.log("🧾 Session créée:", session.id, "Plan:", finalPlan);
+    console.log("🧾 Session Stripe créée:", session.id);
 
     res.json({ url: session.url });
 
   } catch (err) {
-    console.error("❌ Stripe session error:", err.message);
-    res.status(500).json({ error: "Stripe session failed" });
+    console.error("❌ Stripe session error:", err);
+    res.status(500).json({
+      error: "Stripe session failed",
+      details: err.message
+    });
   }
 });
 
-// ================= HEALTH =================
+// ================= HEALTH CHECK =================
 app.get("/", (req, res) => {
   res.json({
     status: "OK",
@@ -186,7 +207,7 @@ app.get("/", (req, res) => {
   });
 });
 
-// ================= START =================
+// ================= START SERVER =================
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
