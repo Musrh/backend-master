@@ -214,7 +214,29 @@ app.get("/", (req, res) => {
     frontend: FRONTEND_URL,
   });
 });
+//Debut Assistant 
+app.post("/api/assistant", async (req, res) => {
+  const { message } = req.body;
 
+  // 🔥 logique métier SaaS
+  let reply = "";
+
+  if (message.includes("prix")) {
+    reply = "Les prix commencent à partir de 29 euros.";
+  }
+  else if (message.includes("commande")) {
+    reply = "Votre commande est en cours de traitement.";
+  }
+  else if (message.includes("livraison")) {
+    reply = "La livraison prend entre 2 et 5 jours.";
+  }
+  else {
+    reply = "Je vais vérifier cela pour vous.";
+  }
+
+  res.json({ reply });
+});
+//Fin Assistant 
 // ================= START =================
 const PORT = process.env.PORT || 8080;
 
