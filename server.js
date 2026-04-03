@@ -16,7 +16,7 @@ app.use(cors({
   methods: ["GET", "POST"],
 }));
 
-// ================= FIREBASE SAFE INIT =================
+// ================= FIREBASE INIT =================
 let serviceAccount = null;
 
 try {
@@ -39,12 +39,12 @@ const db = admin.firestore();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 // ================= FRONTEND =================
-const FRONTEND_URL = "https://musrh.github.io/SaasBuilder";
+const FRONTEND_URL = "https://musrh.github.io/SaaasGenerator";
 
 // ================= JSON =================
 app.use(express.json());
 
-// ================= DEBUG (IMPORTANT) =================
+// ================= DEBUG =================
 app.use((req, res, next) => {
   if (req.path === "/create-stripe-session") {
     console.log("📦 BODY REÇU =", req.body);
@@ -58,7 +58,6 @@ app.post(
   bodyParser.raw({ type: "application/json" }),
   async (req, res) => {
     const sig = req.headers["stripe-signature"];
-
     let event;
 
     try {
@@ -80,6 +79,7 @@ app.post(
 
       if (session.payment_status === "paid") {
         try {
+          // 🔒 Anti-duplicate
           const existing = await db
             .collection("orders")
             .where("sessionId", "==", session.id)
@@ -90,9 +90,8 @@ app.post(
             return res.json({ received: true });
           }
 
-          // ================= METADATA SAFE =================
+          // ================= METADATA =================
           let metadata = {};
-
           try {
             metadata = session.metadata?.data
               ? JSON.parse(session.metadata.data)
@@ -117,7 +116,7 @@ app.post(
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
-          // ================= SITE =================
+          // ================= SITE AUTO CREATE =================
           await db.collection("sites").doc(uid).set({
             userId: uid,
             plan: metadata.plan || "premium",
@@ -131,7 +130,7 @@ app.post(
           console.log("✅ ORDER + SITE OK:", session.id);
 
         } catch (err) {
-          console.error("❌ Webhook error:", err);
+          console.error("❌ Webhook processing error:", err);
         }
       }
     }
@@ -158,6 +157,7 @@ app.post("/create-stripe-session", async (req, res) => {
 
     const finalPlan = plan || "basic";
 
+    // ================= STRIPE SESSION =================
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
       customer_email: email || undefined,
@@ -175,11 +175,12 @@ app.post("/create-stripe-session", async (req, res) => {
 
       mode: "payment",
 
+      // ✅ CORRIGÉ ICI
       success_url:
-        `${FRONTEND_URL}/#/success?plan=${finalPlan}&session_id={CHECKOUT_SESSION_ID}`,
+        `${FRONTEND_URL}/#/payment-success?uid=${clientId}&session_id={CHECKOUT_SESSION_ID}`,
 
       cancel_url:
-        `${FRONTEND_URL}/#/cancel`,
+        `${FRONTEND_URL}/#/payment-cancel`,
 
       metadata: {
         data: JSON.stringify({
@@ -218,5 +219,5 @@ app.get("/", (req, res) => {
 const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, () => {
-  console.log("🚀 SaaS Master running on port", PORT);
+  console.log("🚀 SaaasGenerator backend running on port", PORT);
 });
