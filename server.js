@@ -73,53 +73,95 @@ app.use((req, res, next) => {
 //  UTILITAIRES FIRESTORE
 // ===============================================================
 
-// Charger les produits d'un store (collection prodinfos)
+// Charger les produits du store (collection prodinfos)
+// Cherche par storeUid ET en fallback sans filtre
 const getProduits = async (storeUid) => {
   try {
-    let snap
+    let results = []
+    // Tentative 1 : avec filtre storeUid
     if (storeUid) {
-      snap = await db.collection("prodinfos")
-        .where("storeUid", "==", storeUid)
-        .limit(100).get()
+      const snap1 = await db.collection("prodinfos")
+        .where("storeUid", "==", storeUid).limit(100).get()
+      results = snap1.docs.map(d => ({ id: d.id, ...d.data() }))
+      console.log(`📦 prodinfos (storeUid=${storeUid}): ${results.length} produits`)
     }
-    // Si vide ou pas de storeUid → tout charger
-    if (!storeUid || snap.empty) {
-      snap = await db.collection("prodinfos").limit(100).get()
+    // Fallback : si vide ou pas de storeUid → charger TOUT
+    if (results.length === 0) {
+      const snap2 = await db.collection("prodinfos").limit(100).get()
+      results = snap2.docs.map(d => ({ id: d.id, ...d.data() }))
+      console.log(`📦 prodinfos (fallback global): ${results.length} produits`)
     }
-    return snap.docs.map(d => ({ id: d.id, ...d.data() }))
+    return results
   } catch (e) {
     console.error("❌ Erreur prodinfos:", e.message)
     return []
   }
 }
 
-// Chercher les commandes d'un client (collection cmdinfos)
+// Chercher les commandes client (collection cmdinfos ET orders)
 const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
   try {
-    let query = db.collection("cmdinfos")
-    if (storeUid) query = query.where("storeUid", "==", storeUid)
-    if (email)    query = query.where("customerEmail", "==", email.trim().toLowerCase())
+    let results = []
 
-    const snap = await query.limit(20).get()
-    let results = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+    // ── Chercher dans cmdinfos ─────────────────────────────
+    try {
+      let q = db.collection("cmdinfos")
+      // Filtrer par email si fourni (index requis)
+      if (email) q = q.where("customerEmail", "==", email.trim().toLowerCase())
+      else if (storeUid) q = q.where("storeUid", "==", storeUid)
+      const snap = await q.limit(20).get()
+      results = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      console.log(`📋 cmdinfos: ${results.length} commandes`)
+    } catch(e) { console.warn("cmdinfos query:", e.message) }
 
-    // Filtre supplémentaire par nom
+    // ── Fallback : chercher dans orders (collection racine) ─
+    if (results.length === 0) {
+      try {
+        let q2 = db.collection("orders")
+        if (email) q2 = q2.where("email", "==", email.trim().toLowerCase())
+        else if (storeUid) q2 = q2.where("clientId", "==", storeUid)
+        const snap2 = await q2.limit(20).get()
+        const r2 = snap2.docs.map(d => ({
+          id: d.id, ...d.data(),
+          customerName:  d.data().customerName  || d.data().name || "",
+          customerEmail: d.data().customerEmail || d.data().email || "",
+        }))
+        results = [...results, ...r2]
+        console.log(`📋 orders (fallback): ${r2.length} commandes`)
+      } catch(e) { console.warn("orders fallback query:", e.message) }
+    }
+
+    // ── Chercher aussi dans users/{storeUid}/orders ─────────
+    if (storeUid) {
+      try {
+        let q3 = db.collection("users").doc(storeUid).collection("orders")
+        if (email) q3 = q3.where("customerEmail", "==", email.trim().toLowerCase())
+        const snap3 = await q3.limit(20).get()
+        const r3 = snap3.docs.map(d => ({ id: d.id, ...d.data() }))
+        // Dédupliquer
+        const existingIds = new Set(results.map(r => r.id))
+        results = [...results, ...r3.filter(r => !existingIds.has(r.id))]
+        console.log(`📋 users/orders: ${r3.length} commandes`)
+      } catch(e) { console.warn("users/orders query:", e.message) }
+    }
+
+    // ── Filtres client ─────────────────────────────────────
     if (nom) {
       const n = nom.toLowerCase()
       results = results.filter(r =>
-        (r.customerName || "").toLowerCase().includes(n)
+        (r.customerName || r.name || "").toLowerCase().includes(n)
       )
     }
-    // Filtre par date
     if (date) {
       results = results.filter(r => {
-        const d = r.createdAt?.toDate?.()?.toISOString?.() || r.createdAt || ""
+        const d = r.createdAt?.toDate?.()?.toISOString?.() || String(r.createdAt || "")
         return d.includes(date)
       })
     }
+    console.log(`📋 Total commandes trouvées: ${results.length}`)
     return results
   } catch (e) {
-    console.error("❌ Erreur cmdinfos:", e.message)
+    console.error("❌ Erreur getCmdinfos:", e.message)
     return []
   }
 }
@@ -193,12 +235,14 @@ app.post("/api/assistant", async (req, res) => {
 
   try {
     // ── 1. Charger le contexte Firestore ───────────────────────
+    console.log(`🤖 Assistant appelé | storeUid=${storeUid} | lang=${lang} | msg="${message.slice(0,50)}"`)
     const [produits, cmds] = await Promise.all([
       getProduits(storeUid),
-      clientInfo.email || clientInfo.nom
+      (clientInfo.email || clientInfo.nom)
         ? getCmdinfos(storeUid, clientInfo)
         : Promise.resolve([])
     ])
+    console.log(`📊 Contexte: ${produits.length} produits, ${cmds.length} commandes`)
 
     const produitsCtx = buildProduitsContext(produits)
     const cmdsCtx     = cmds.length ? buildCmdContext(cmds) : ""
