@@ -1,5 +1,5 @@
 // ===============================================================
-//  server.js — Backend SaaasGenerator + Groq AI + Stripe
+//  server.js — SaaS Builder + Stripe + Firestore + Groq AI
 // ===============================================================
 
 import express from "express"
@@ -13,36 +13,26 @@ import Groq from "groq-sdk"
 dotenv.config()
 
 // ─────────────────────────────────────────────
-// APP
-// ─────────────────────────────────────────────
 const app = express()
 const PORT = process.env.PORT || 8080
 
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
-
-// ⚠️ IMPORTANT : on ne bloque PAS le webhook Stripe
-app.use((req, res, next) => {
-  if (req.originalUrl === "/webhook") return next()
-  express.json()(req, res, next)
-})
+app.use(express.json())
 
 // ─────────────────────────────────────────────
 // FIREBASE
 // ─────────────────────────────────────────────
 let serviceAccount = null
-
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
 } catch (e) {
-  console.error("❌ Firebase service account JSON invalide")
+  console.error("❌ Firebase service account invalide")
 }
 
 if (serviceAccount) {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   })
-} else {
-  console.error("❌ Firebase NON initialisé")
 }
 
 const db = admin.firestore()
@@ -62,97 +52,7 @@ const groq = new Groq({
 const FRONTEND_URL = "https://musrh.github.io/SaaasGenerator"
 
 // ===============================================================
-// DEBUG
-// ===============================================================
-app.use((req, res, next) => {
-  if (req.path === "/create-stripe-session") {
-    console.log("📦 BODY REÇU =", req.body)
-  }
-  next()
-})
-
-// ===============================================================
-// STRIPE WEBHOOK (VERSION CONSERVÉE + SAFE)
-// ===============================================================
-app.post(
-  "/webhook",
-  bodyParser.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"]
-
-    let event
-
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        process.env.STRIPE_WEBHOOK_SECRET
-      )
-    } catch (err) {
-      console.error("❌ Webhook error:", err.message)
-      return res.status(400).send(`Webhook Error: ${err.message}`)
-    }
-
-    console.log("📩 Stripe event:", event.type)
-
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object
-
-      console.log("💰 PAYMENT SUCCESS:", session.id)
-
-      // ⚠️ on garde ton comportement original
-      if (session.payment_status === "paid") {
-        try {
-          const existing = await db
-            .collection("orders")
-            .where("sessionId", "==", session.id)
-            .get()
-
-          if (!existing.empty) {
-            console.log("⚠️ Order déjà existante")
-            return res.json({ received: true })
-          }
-
-          let metadata = {}
-
-          try {
-            metadata = session.metadata?.data
-              ? JSON.parse(session.metadata.data)
-              : {}
-          } catch (e) {
-            console.warn("⚠️ metadata parse error")
-          }
-
-          const uid = metadata.clientId || "master"
-
-          const orderData = {
-            email: session.customer_email || metadata.email || "",
-            items: metadata.items || [],
-            montant: (session.amount_total || 0) / 100,
-            adresse: metadata.adresseLivraison || "",
-            clientId: uid,
-            plan: metadata.plan || "basic",
-            paymentMethod: "stripe",
-            sessionId: session.id,
-            status: "paid",
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          }
-
-          await db.collection("orders").doc(session.id).set(orderData)
-
-          console.log("✅ ORDER SAVED FIRESTORE:", session.id)
-        } catch (err) {
-          console.error("❌ Firestore error:", err)
-        }
-      }
-    }
-
-    res.json({ received: true })
-  }
-)
-
-// ===============================================================
-// STRIPE SESSION (inchangé)
+// 🔥 CREATE STRIPE SESSION (CORRIGÉ)
 // ===============================================================
 app.post("/create-stripe-session", async (req, res) => {
   try {
@@ -161,6 +61,7 @@ app.post("/create-stripe-session", async (req, res) => {
       email,
       adresseLivraison,
       clientId,
+      ownerId,   // ⭐ AJOUT IMPORTANT
       plan,
       successUrl,
       cancelUrl,
@@ -182,58 +83,157 @@ app.post("/create-stripe-session", async (req, res) => {
       line_items: items.map((item) => ({
         price_data: {
           currency: "eur",
-          product_data: { name: item.nom },
+          product_data: {
+            name: item.nom,
+          },
           unit_amount: Math.round(item.prix * 100),
         },
         quantity: item.quantity,
       })),
 
       mode: "payment",
-
-      success_url:
-        successUrl ||
-        `${FRONTEND_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-
-      cancel_url: cancelUrl || `${FRONTEND_URL}/`,
+      success_url: successUrl || `${FRONTEND_URL}/#/success`,
+      cancel_url: cancelUrl || `${FRONTEND_URL}/#/cart`,
 
       metadata: {
         data: JSON.stringify({
           items,
-          adresseLivraison: adresseLivraison || "",
           email: email || "",
-          clientId: clientId || "master",
+          adresseLivraison: adresseLivraison || "",
+          clientId: clientId || "",
+          ownerId: ownerId || "", // ⭐ IMPORTANT
           plan: plan || "basic",
         }),
       },
     })
 
-    console.log("🧾 Stripe session OK:", session.id)
+    console.log("🧾 Stripe session créée:", session.id)
 
     res.json({ url: session.url })
   } catch (err) {
-    console.error("❌ Stripe session error:", err)
-    res.status(500).json({
-      error: "Stripe session failed",
-      details: err.message,
-    })
+    console.error("❌ Stripe error:", err.message)
+    res.status(500).json({ error: err.message })
   }
 })
 
 // ===============================================================
-// ROOT
+// 🔥 WEBHOOK STRIPE (CORRIGÉ + FIRESTORE)
+// ===============================================================
+app.post(
+  "/webhook",
+  bodyParser.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"]
+
+    let event
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      )
+    } catch (err) {
+      console.error("❌ Webhook error:", err.message)
+      return res.status(400).send(`Webhook Error: ${err.message}`)
+    }
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object
+
+      console.log("💰 PAYMENT OK:", session.id)
+
+      try {
+        const metadata = session.metadata?.data
+          ? JSON.parse(session.metadata.data)
+          : {}
+
+        const ownerId = metadata.ownerId || "unknown"
+        const userId = metadata.clientId || session.customer_email || "unknown"
+
+        // ❗ Vérification anti-doublon
+        const existing = await db
+          .collection("orders")
+          .where("sessionId", "==", session.id)
+          .get()
+
+        if (!existing.empty) {
+          console.log("⚠️ Commande déjà existante")
+          return res.json({ received: true })
+        }
+
+        // 🔥 SAVE ORDER FIRESTORE
+        await db.collection("orders").doc(session.id).set({
+          sessionId: session.id,
+
+          // 👤 client
+          userId,
+          email: session.customer_email || metadata.email || "",
+
+          // 🏪 STORE OWNER (IMPORTANT)
+          ownerId,
+
+          items: metadata.items || [],
+          total: (session.amount_total || 0) / 100,
+
+          adresse: metadata.adresseLivraison || "",
+
+          status: "pending",
+          paymentMethod: "stripe",
+
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        })
+
+        console.log("✅ ORDER SAVED FIRESTORE")
+      } catch (err) {
+        console.error("❌ Firestore error:", err.message)
+      }
+    }
+
+    res.json({ received: true })
+  }
+)
+
+// ===============================================================
+// 🔥 GET ORDERS (STORE)
+// ===============================================================
+app.get("/api/orders/:ownerId", async (req, res) => {
+  try {
+    const snap = await db
+      .collection("orders")
+      .where("ownerId", "==", req.params.ownerId)
+      .orderBy("createdAt", "desc")
+      .limit(100)
+      .get()
+
+    const orders = snap.docs.map((d) => ({
+      id: d.id,
+      ...d.data(),
+    }))
+
+    res.json({ orders, count: orders.length })
+  } catch (e) {
+    console.error(e.message)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ===============================================================
+// 🔥 HEALTH CHECK
 // ===============================================================
 app.get("/", (req, res) => {
   res.json({
     status: "OK",
-    service: "SaaasGenerator Backend",
-    webhook: "stripe enabled",
-    firestore: "orders enabled",
+    service: "SaaS Backend FIXED",
+    firebase: !!serviceAccount,
+    stripe: true,
   })
 })
 
 // ===============================================================
-// START SERVER
+// 🔥 START SERVER
 // ===============================================================
 app.listen(PORT, () => {
-  console.log(`🚀 Backend running on port ${PORT}`)
+  console.log("🚀 Server running on port", PORT)
 })
