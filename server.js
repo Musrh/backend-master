@@ -1,5 +1,5 @@
 // ===============================================================
-//  server.js — Backend SaaasGenerator + Assistant IA Groq
+//  server.js — Backend SaaasGenerator + Groq AI + Stripe
 // ===============================================================
 
 import express from "express"
@@ -12,18 +12,23 @@ import Groq from "groq-sdk"
 
 dotenv.config()
 
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
 // APP
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
 const app = express()
 const PORT = process.env.PORT || 8080
 
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
-app.use(express.json())
 
-// ───────────────────────────────────────────────────────────────
+// ⚠️ IMPORTANT : on ne bloque PAS le webhook Stripe
+app.use((req, res, next) => {
+  if (req.originalUrl === "/webhook") return next()
+  express.json()(req, res, next)
+})
+
+// ─────────────────────────────────────────────
 // FIREBASE
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
 let serviceAccount = null
 
 try {
@@ -42,14 +47,14 @@ if (serviceAccount) {
 
 const db = admin.firestore()
 
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
 // STRIPE
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
-// ───────────────────────────────────────────────────────────────
-// GROQ AI
-// ───────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────
+// GROQ
+// ─────────────────────────────────────────────
 const groq = new Groq({
   apiKey: process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY,
 })
@@ -57,32 +62,8 @@ const groq = new Groq({
 const FRONTEND_URL = "https://musrh.github.io/SaaasGenerator"
 
 // ===============================================================
-// 🔥 NOUVEAU ENDPOINT IMPORTANT (PaymentSuccess FIX)
-// ===============================================================
-app.get("/api/order/:sessionId", async (req, res) => {
-  try {
-    const snap = await db
-      .collection("orders")
-      .doc(req.params.sessionId)
-      .get()
-
-    if (!snap.exists) {
-      return res.status(404).json({ error: "Order not found" })
-    }
-
-    return res.json({
-      id: snap.id,
-      ...snap.data(),
-    })
-  } catch (e) {
-    console.error("❌ order fetch error:", e.message)
-    res.status(500).json({ error: e.message })
-  }
-})
-
-// ───────────────────────────────────────────────────────────────
 // DEBUG
-// ───────────────────────────────────────────────────────────────
+// ===============================================================
 app.use((req, res, next) => {
   if (req.path === "/create-stripe-session") {
     console.log("📦 BODY REÇU =", req.body)
@@ -91,13 +72,14 @@ app.use((req, res, next) => {
 })
 
 // ===============================================================
-// 🔥 STRIPE WEBHOOK (SOURCE DE VÉRITÉ)
+// STRIPE WEBHOOK (VERSION CONSERVÉE + SAFE)
 // ===============================================================
 app.post(
   "/webhook",
   bodyParser.raw({ type: "application/json" }),
   async (req, res) => {
     const sig = req.headers["stripe-signature"]
+
     let event
 
     try {
@@ -111,14 +93,16 @@ app.post(
       return res.status(400).send(`Webhook Error: ${err.message}`)
     }
 
+    console.log("📩 Stripe event:", event.type)
+
     if (event.type === "checkout.session.completed") {
       const session = event.data.object
 
       console.log("💰 PAYMENT SUCCESS:", session.id)
 
+      // ⚠️ on garde ton comportement original
       if (session.payment_status === "paid") {
         try {
-          // anti doublon
           const existing = await db
             .collection("orders")
             .where("sessionId", "==", session.id)
@@ -135,12 +119,13 @@ app.post(
             metadata = session.metadata?.data
               ? JSON.parse(session.metadata.data)
               : {}
-          } catch (e) {}
+          } catch (e) {
+            console.warn("⚠️ metadata parse error")
+          }
 
           const uid = metadata.clientId || "master"
 
-          // 🔥 ORDER CREATION (SOURCE UNIQUE)
-          await db.collection("orders").doc(session.id).set({
+          const orderData = {
             email: session.customer_email || metadata.email || "",
             items: metadata.items || [],
             montant: (session.amount_total || 0) / 100,
@@ -151,11 +136,13 @@ app.post(
             sessionId: session.id,
             status: "paid",
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          })
+          }
 
-          console.log("✅ ORDER CREATED:", session.id)
+          await db.collection("orders").doc(session.id).set(orderData)
+
+          console.log("✅ ORDER SAVED FIRESTORE:", session.id)
         } catch (err) {
-          console.error("❌ Webhook processing error:", err)
+          console.error("❌ Firestore error:", err)
         }
       }
     }
@@ -165,7 +152,7 @@ app.post(
 )
 
 // ===============================================================
-// CREATE STRIPE SESSION
+// STRIPE SESSION (inchangé)
 // ===============================================================
 app.post("/create-stripe-session", async (req, res) => {
   try {
@@ -204,7 +191,8 @@ app.post("/create-stripe-session", async (req, res) => {
       mode: "payment",
 
       success_url:
-        successUrl || `${FRONTEND_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+        successUrl ||
+        `${FRONTEND_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
 
       cancel_url: cancelUrl || `${FRONTEND_URL}/`,
 
@@ -232,23 +220,19 @@ app.post("/create-stripe-session", async (req, res) => {
 })
 
 // ===============================================================
-// HEALTH CHECK
+// ROOT
 // ===============================================================
 app.get("/", (req, res) => {
   res.json({
     status: "OK",
-    service: "SaaasGenerator Backend + Groq AI",
-    firebase: serviceAccount ? "OK" : "❌",
-    endpoints: [
-      "POST /create-stripe-session",
-      "POST /webhook",
-      "GET /api/order/:sessionId", // 🔥 AJOUTÉ
-    ],
+    service: "SaaasGenerator Backend",
+    webhook: "stripe enabled",
+    firestore: "orders enabled",
   })
 })
 
 // ===============================================================
-// START
+// START SERVER
 // ===============================================================
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on port ${PORT}`)
