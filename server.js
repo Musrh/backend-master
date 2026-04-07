@@ -455,8 +455,8 @@ app.post("/create-stripe-session", async (req, res) => {
         quantity: item.quantity,
       })),
       mode: "payment",
-      success_url: successUrl || `${FRONTEND_URL}/`,
-      cancel_url:  cancelUrl  || `${FRONTEND_URL}/`,
+      success_url: successUrl || `${FRONTEND_URL}/paymentsuccess`,
+      cancel_url:  cancelUrl  || `${FRONTEND_URL}/paymentcancel`,
       metadata: {
         data: JSON.stringify({
           items,
