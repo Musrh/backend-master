@@ -55,7 +55,7 @@ const groq = new Groq({
   apiKey: process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY
 })
 
-const FRONTEND_URL = "https://musrh.github.io/SaaasGenerator"
+const FRONTEND_URL = "https://musrh.github.io/SaaasGenerator/#/site/mrstore"
 
 // ── JSON middleware ───────────────────────────────────────────
 app.use(express.json())
