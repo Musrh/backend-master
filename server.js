@@ -50,12 +50,12 @@ const db = admin.firestore()
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
 // ── Groq ──────────────────────────────────────────────────────
-// Variable d'env : VITE_GROQ_API_KEY ou GROQ_API_KEY
 const groq = new Groq({
   apiKey: process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY
 })
 
-const FRONTEND_URL = "https://musrh.github.io/SaaasGenerator/#/site/mrstore"
+// MODIFIÉ : URL de base sans slug hardcodé
+const FRONTEND_BASE_URL = "https://musrh.github.io/SaaasGenerator"
 
 // ── JSON middleware ───────────────────────────────────────────
 app.use(express.json())
@@ -74,18 +74,15 @@ app.use((req, res, next) => {
 // ===============================================================
 
 // Charger les produits du store (collection prodinfos)
-// Cherche par storeUid ET en fallback sans filtre
 const getProduits = async (storeUid) => {
   try {
     let results = []
-    // Tentative 1 : avec filtre storeUid
     if (storeUid) {
       const snap1 = await db.collection("prodinfos")
         .where("storeUid", "==", storeUid).limit(100).get()
       results = snap1.docs.map(d => ({ id: d.id, ...d.data() }))
       console.log(`📦 prodinfos (storeUid=${storeUid}): ${results.length} produits`)
     }
-    // Fallback : si vide ou pas de storeUid → charger TOUT
     if (results.length === 0) {
       const snap2 = await db.collection("prodinfos").limit(100).get()
       results = snap2.docs.map(d => ({ id: d.id, ...d.data() }))
@@ -98,15 +95,13 @@ const getProduits = async (storeUid) => {
   }
 }
 
-// Chercher les commandes client (collection cmdinfos ET orders)
+// Chercher les commandes client
 const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
   try {
     let results = []
 
-    // ── Chercher dans cmdinfos ─────────────────────────────
     try {
       let q = db.collection("cmdinfos")
-      // Filtrer par email si fourni (index requis)
       if (email) q = q.where("customerEmail", "==", email.trim().toLowerCase())
       else if (storeUid) q = q.where("storeUid", "==", storeUid)
       const snap = await q.limit(20).get()
@@ -114,7 +109,6 @@ const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
       console.log(`📋 cmdinfos: ${results.length} commandes`)
     } catch(e) { console.warn("cmdinfos query:", e.message) }
 
-    // ── Fallback : chercher dans orders (collection racine) ─
     if (results.length === 0) {
       try {
         let q2 = db.collection("orders")
@@ -131,21 +125,18 @@ const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
       } catch(e) { console.warn("orders fallback query:", e.message) }
     }
 
-    // ── Chercher aussi dans users/{storeUid}/orders ─────────
     if (storeUid) {
       try {
         let q3 = db.collection("users").doc(storeUid).collection("orders")
         if (email) q3 = q3.where("customerEmail", "==", email.trim().toLowerCase())
         const snap3 = await q3.limit(20).get()
         const r3 = snap3.docs.map(d => ({ id: d.id, ...d.data() }))
-        // Dédupliquer
         const existingIds = new Set(results.map(r => r.id))
         results = [...results, ...r3.filter(r => !existingIds.has(r.id))]
         console.log(`📋 users/orders: ${r3.length} commandes`)
       } catch(e) { console.warn("users/orders query:", e.message) }
     }
 
-    // ── Filtres client ─────────────────────────────────────
     if (nom) {
       const n = nom.toLowerCase()
       results = results.filter(r =>
@@ -166,7 +157,7 @@ const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
   }
 }
 
-// Sauvegarder une requête non résolue (collection requetes)
+// Sauvegarder une requête non résolue
 const saveRequete = async (storeUid, data) => {
   try {
     const ref = await db.collection("requetes").add({
@@ -218,23 +209,21 @@ const buildCmdContext = (cmds) => {
 
 // ===============================================================
 //  ENDPOINT : POST /api/assistant
-//  Chat avec l'assistant IA Groq
 // ===============================================================
 app.post("/api/assistant", async (req, res) => {
   const {
-    message,        // message du client
-    history = [],   // historique de la conversation [ {role, content} ]
-    storeUid,       // uid du propriétaire du store
-    storeEmail,     // email du store (pour fallback)
-    storeName,      // nom du store
-    lang = "fr",    // langue
-    clientInfo = {} // { nom, email, date } si déjà renseigné
+    message,
+    history = [],
+    storeUid,
+    storeEmail,
+    storeName,
+    lang = "fr",
+    clientInfo = {}
   } = req.body
 
   if (!message) return res.status(400).json({ error: "message requis" })
 
   try {
-    // ── 1. Charger le contexte Firestore ───────────────────────
     console.log(`🤖 Assistant appelé | storeUid=${storeUid} | lang=${lang} | msg="${message.slice(0,50)}"`)
     const [produits, cmds] = await Promise.all([
       getProduits(storeUid),
@@ -247,7 +236,6 @@ app.post("/api/assistant", async (req, res) => {
     const produitsCtx = buildProduitsContext(produits)
     const cmdsCtx     = cmds.length ? buildCmdContext(cmds) : ""
 
-    // ── 2. System prompt ───────────────────────────────────────
     const systemPrompt = `
 Tu es l'assistant vocal IA du store "${storeName || "notre boutique"}".
 Tu aides les clients par téléphone ou chat. Tu parles en ${lang === "fr" ? "français" : lang === "ar" ? "arabe" : lang === "es" ? "espagnol" : "anglais"}.
@@ -271,14 +259,12 @@ ${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite
 7. Statuts commandes : en attente | payée | expédiée | livrée | annulée | retour | renseignements requis
 `.trim()
 
-    // ── 3. Construire les messages pour Groq ───────────────────
     const messages = [
       { role: "system",    content: systemPrompt },
-      ...history.slice(-8), // Garder les 8 derniers échanges
+      ...history.slice(-8),
       { role: "user",      content: message }
     ]
 
-    // ── 4. Appel Groq ──────────────────────────────────────────
     const completion = await groq.chat.completions.create({
       model:       "llama-3.3-70b-versatile",
       messages,
@@ -288,19 +274,16 @@ ${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite
 
     const reply = completion.choices[0]?.message?.content?.trim() || ""
 
-    // ── 5. Détecter les actions spéciales ─────────────────────
     let action      = null
     let actionData  = null
     let cleanReply  = reply
 
-    // Détecter JSON action dans la réponse
     const jsonMatch = reply.match(/\{[\s\S]*"action"[\s\S]*\}/)
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0])
         action     = parsed.action
         actionData = parsed.data || { reason: parsed.reason }
-        // Remplacer le JSON par un message naturel
         cleanReply = reply.replace(jsonMatch[0], "").trim()
         if (!cleanReply) {
           if (action === "SHOW_REQUEST_FORM") {
@@ -316,7 +299,6 @@ ${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite
       } catch(e) { /* pas un JSON valide, ignorer */ }
     }
 
-    // ── 6. Réponse ─────────────────────────────────────────────
     res.json({
       reply:      cleanReply,
       action,
@@ -335,7 +317,6 @@ ${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite
 
 // ===============================================================
 //  ENDPOINT : POST /api/save-request
-//  Sauvegarder une requête non résolue dans Firestore
 // ===============================================================
 app.post("/api/save-request", async (req, res) => {
   const { storeUid, nom, email, telephone, adresse, question } = req.body
@@ -353,7 +334,6 @@ app.post("/api/save-request", async (req, res) => {
 
 // ===============================================================
 //  ENDPOINT : GET /api/products/:storeUid
-//  Retourner les produits d'un store (pour debug / frontend)
 // ===============================================================
 app.get("/api/products/:storeUid", async (req, res) => {
   const produits = await getProduits(req.params.storeUid)
@@ -363,7 +343,6 @@ app.get("/api/products/:storeUid", async (req, res) => {
 
 // ===============================================================
 //  ENDPOINT : GET /api/orders/:storeUid
-//  Retourner les commandes d'un store
 // ===============================================================
 app.get("/api/orders/:storeUid", async (req, res) => {
   const { email, nom, date } = req.query
@@ -373,7 +352,7 @@ app.get("/api/orders/:storeUid", async (req, res) => {
 
 
 // ===============================================================
-//  WEBHOOK STRIPE (existant — conservé intact)
+//  WEBHOOK STRIPE (conservé intact)
 // ===============================================================
 app.post(
   "/webhook",
@@ -429,11 +408,12 @@ app.post(
 
 
 // ===============================================================
-//  CREATE STRIPE SESSION (existant — conservé intact)
+//  CREATE STRIPE SESSION
+//  MODIFIÉ : accepte slug dans le body et l'inclut dans success_url
 // ===============================================================
 app.post("/create-stripe-session", async (req, res) => {
   try {
-    let { items, email, adresseLivraison, clientId, plan, successUrl, cancelUrl } = req.body
+    let { items, email, adresseLivraison, clientId, plan, successUrl, cancelUrl, slug } = req.body
 
     items = (items || []).map(item => ({
       nom:      item.nom      || item.title || "Produit",
@@ -442,6 +422,15 @@ app.post("/create-stripe-session", async (req, res) => {
     }))
 
     if (!items.length) return res.status(400).json({ error: "Panier vide" })
+
+    // MODIFIÉ : construire success_url avec le slug si fourni
+    const defaultSuccessUrl = slug
+      ? `${FRONTEND_BASE_URL}/#/paymentsuccess?slug=${encodeURIComponent(slug)}`
+      : `${FRONTEND_BASE_URL}/#/paymentsuccess`
+
+    const defaultCancelUrl = slug
+      ? `${FRONTEND_BASE_URL}/#/site/${encodeURIComponent(slug)}`
+      : `${FRONTEND_BASE_URL}/#/`
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -455,8 +444,8 @@ app.post("/create-stripe-session", async (req, res) => {
         quantity: item.quantity,
       })),
       mode: "payment",
-      success_url: successUrl || `${FRONTEND_URL}/paymentsuccess`,
-      cancel_url:  cancelUrl  || `${FRONTEND_URL}/paymentcancel`,
+      success_url: successUrl || defaultSuccessUrl,
+      cancel_url:  cancelUrl  || defaultCancelUrl,
       metadata: {
         data: JSON.stringify({
           items,
@@ -464,11 +453,12 @@ app.post("/create-stripe-session", async (req, res) => {
           email:    email    || "",
           clientId: clientId || "master",
           plan:     plan     || "basic",
+          slug:     slug     || "",   // ← slug sauvegardé dans les metadata
         }),
       },
     })
 
-    console.log("🧾 Stripe session OK:", session.id)
+    console.log("🧾 Stripe session OK:", session.id, slug ? `(slug: ${slug})` : "")
     res.json({ url: session.url })
 
   } catch (err) {
@@ -487,7 +477,7 @@ app.get("/", (req, res) => {
     service:  "SaaasGenerator Backend + Groq AI",
     groq:     !!process.env.VITE_GROQ_API_KEY ? "configuré" : "❌ clé manquante",
     firebase: serviceAccount ? "configuré" : "❌ non configuré",
-    frontend: FRONTEND_URL,
+    frontend: FRONTEND_BASE_URL,
     endpoints: [
       "POST /api/assistant",
       "POST /api/save-request",
