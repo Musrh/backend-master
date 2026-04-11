@@ -113,28 +113,52 @@ const getProduits = async (storeUid) => {
       } catch(e0) { console.warn("siteData read:", e0.message) }
     }
 
+    // Helper normalisation (appliqué immédiatement à chaque doc)
+    const normalize = (p, src) => ({
+      id:          p.id          || String(p.name || p.nom),
+      name:        p.name        || p.nom   || "Produit",
+      price:       p.price       !== undefined ? p.price : (p.prix !== undefined ? p.prix : 0),
+      description: p.description || p.desc  || "",
+      stock:       p.stock       !== undefined ? p.stock : "disponible",
+      currency:    p.currency    || p.devise || "€",
+      badge:       p.badge       || "",
+      storeUid:    p.storeUid    || storeUid,
+      source:      src || p.source || "collection",
+    })
+
+    // Helper déduplication par name normalisé
+    const addIfNew = (raw, src) => {
+      const n = normalize(raw, src)
+      if (!results.find(r => r.name === n.name)) results.push(n)
+    }
+
     // ── SOURCE 2 : prodinfos filtré par storeUid ──────────────
+    // prodinfos peut avoir nom/prix/desc (ancien format)
     if (storeUid) {
       try {
         const snap1 = await db.collection("prodinfos")
           .where("storeUid", "==", storeUid).limit(100).get()
-        snap1.docs.forEach(d => {
-          const p = { id: d.id, ...d.data() }
-          if (!results.find(r => r.name === p.name)) results.push(p)
-        })
+        snap1.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos"))
         console.log(`📦 prodinfos(${storeUid}): ${snap1.docs.length} produits`)
       } catch(e1) { console.warn("prodinfos:", e1.message) }
     }
 
-    // ── SOURCE 3 : products filtré par storeUid ───────────────
+    // ── SOURCE 3 : prodinfos SANS filtre storeUid (fallback)───
+    // Cas où storeUid n'est pas encore dans prodinfos
+    if (results.length === 0) {
+      try {
+        const snap1b = await db.collection("prodinfos").limit(100).get()
+        snap1b.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos-global"))
+        console.log(`📦 prodinfos(global): ${snap1b.docs.length} produits`)
+      } catch(e1b) { console.warn("prodinfos global:", e1b.message) }
+    }
+
+    // ── SOURCE 4 : products filtré par storeUid ───────────────
     if (storeUid) {
       try {
         const snap2 = await db.collection("products")
           .where("storeUid", "==", storeUid).limit(100).get()
-        snap2.docs.forEach(d => {
-          const p = { id: d.id, ...d.data() }
-          if (!results.find(r => r.name === p.name)) results.push(p)
-        })
+        snap2.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "products"))
         console.log(`📦 products(${storeUid}): ${snap2.docs.length} produits`)
       } catch(e2) { console.warn("products:", e2.message) }
     }
@@ -142,24 +166,13 @@ const getProduits = async (storeUid) => {
     // ── FALLBACK GLOBAL si toujours vide ──────────────────────
     if (results.length === 0) {
       try {
-        const snap3 = await db.collection("prodinfos").limit(50).get()
-        snap3.docs.forEach(d => results.push({ id: d.id, ...d.data() }))
-        console.log(`📦 prodinfos(global fallback): ${snap3.docs.length}`)
-      } catch(e3) { console.warn("prodinfos global:", e3.message) }
+        const snap3 = await db.collection("products").limit(50).get()
+        snap3.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "products-global"))
+        console.log(`📦 products(global fallback): ${snap3.docs.length}`)
+      } catch(e3) { console.warn("products global:", e3.message) }
     }
 
-    // ── Normaliser les champs ─────────────────────────────────
-    results = results.map(p => ({
-      id:          p.id || String(p.name),
-      name:        p.name        || p.nom   || "Produit",
-      price:       p.price       || p.prix  || 0,
-      description: p.description || p.desc  || "",
-      stock:       p.stock !== undefined ? p.stock : "disponible",
-      currency:    p.currency    || p.devise || "€",
-      badge:       p.badge       || "",
-      storeUid:    p.storeUid    || storeUid,
-      source:      p.source      || "collection",
-    }))
+    // Déjà normalisés par addIfNew
 
     console.log(`✅ TOTAL ${results.length} produits pour storeUid=${storeUid || "global"}`)
     return results
@@ -427,6 +440,29 @@ app.post("/api/save-request", async (req, res) => {
   }
 })
 
+
+// ===============================================================
+//  ENDPOINT : GET /api/debug/:storeUid — Diagnostic assistant
+//  Voir exactement ce que l'assistant trouve comme produits
+//  Usage : GET https://backend.../api/debug/tHORgU4qynaDjQRh...
+// ===============================================================
+app.get("/api/debug/:storeUid", async (req, res) => {
+  const { storeUid } = req.params
+  try {
+    const produits = await getProduits(storeUid)
+    res.json({
+      storeUid,
+      count:    produits.length,
+      produits: produits.map(p => ({
+        name:   p.name,
+        price:  p.price,
+        desc:   p.description,
+        source: p.source,
+      })),
+      promptInjecte: buildProduitsContext(produits),
+    })
+  } catch(e) { res.status(500).json({ error: e.message }) }
+})
 
 // ===============================================================
 //  ENDPOINT : GET /api/products/:storeUid
