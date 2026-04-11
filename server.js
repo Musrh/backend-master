@@ -73,64 +73,95 @@ app.use((req, res, next) => {
 //  UTILITAIRES FIRESTORE
 // ===============================================================
 
-// Charger les produits du store
-// Cherche dans prodinfos ET products (selon où les produits sont sauvegardés)
+// Charger les produits du store depuis TOUTES les sources
+// SOURCE PRINCIPALE : users/{storeUid}/siteData (les vrais produits du store builder)
+// SOURCES SECONDAIRES : prodinfos, products (pour l'assistant AddProduct)
 const getProduits = async (storeUid) => {
   try {
     let results = []
 
-    // ── Tentative 1 : prodinfos filtré par storeUid ───────────
+    // ── SOURCE 1 (PRINCIPALE) : siteData du store ─────────────
+    // Les produits affichés dans le store viennent de siteData.pages[n].sections
+    if (storeUid) {
+      try {
+        const userDoc = await db.collection("users").doc(storeUid).get()
+        if (userDoc.exists) {
+          const siteData = userDoc.data().siteData
+          if (siteData?.pages) {
+            for (const page of siteData.pages) {
+              for (const section of (page.sections || [])) {
+                if (section.type === "products" && Array.isArray(section.items)) {
+                  section.items.forEach(p => {
+                    results.push({
+                      id:          String(p.id || p.name),
+                      name:        p.name        || "Produit",
+                      price:       p.price       || 0,
+                      description: p.description || "",
+                      stock:       p.stock       !== undefined ? p.stock : "disponible",
+                      currency:    p.currency    || "€",
+                      badge:       p.badge       || "",
+                      storeUid,
+                      source:      "siteData",
+                    })
+                  })
+                }
+              }
+            }
+          }
+          console.log(`📦 siteData(${storeUid}): ${results.length} produits trouvés`)
+        }
+      } catch(e0) { console.warn("siteData read:", e0.message) }
+    }
+
+    // ── SOURCE 2 : prodinfos filtré par storeUid ──────────────
     if (storeUid) {
       try {
         const snap1 = await db.collection("prodinfos")
           .where("storeUid", "==", storeUid).limit(100).get()
-        results = snap1.docs.map(d => ({ id: d.id, ...d.data() }))
-        console.log(`📦 prodinfos(storeUid=${storeUid}): ${results.length} produits`)
-      } catch(e1) { console.warn("prodinfos filtrée:", e1.message) }
+        snap1.docs.forEach(d => {
+          const p = { id: d.id, ...d.data() }
+          if (!results.find(r => r.name === p.name)) results.push(p)
+        })
+        console.log(`📦 prodinfos(${storeUid}): ${snap1.docs.length} produits`)
+      } catch(e1) { console.warn("prodinfos:", e1.message) }
     }
 
-    // ── Tentative 2 : collection products filtré par storeUid ─
-    // (AddProduct.vue écrit dans products/)
-    if (results.length === 0 && storeUid) {
+    // ── SOURCE 3 : products filtré par storeUid ───────────────
+    if (storeUid) {
       try {
         const snap2 = await db.collection("products")
           .where("storeUid", "==", storeUid).limit(100).get()
-        results = snap2.docs.map(d => ({ id: d.id, ...d.data() }))
-        console.log(`📦 products(storeUid=${storeUid}): ${results.length} produits`)
-      } catch(e2) { console.warn("products filtrée:", e2.message) }
+        snap2.docs.forEach(d => {
+          const p = { id: d.id, ...d.data() }
+          if (!results.find(r => r.name === p.name)) results.push(p)
+        })
+        console.log(`📦 products(${storeUid}): ${snap2.docs.length} produits`)
+      } catch(e2) { console.warn("products:", e2.message) }
     }
 
-    // ── Tentative 3 : prodinfos sans filtre (fallback global) ─
+    // ── FALLBACK GLOBAL si toujours vide ──────────────────────
     if (results.length === 0) {
       try {
-        const snap3 = await db.collection("prodinfos").limit(100).get()
-        results = snap3.docs.map(d => ({ id: d.id, ...d.data() }))
-        console.log(`📦 prodinfos(global): ${results.length} produits`)
+        const snap3 = await db.collection("prodinfos").limit(50).get()
+        snap3.docs.forEach(d => results.push({ id: d.id, ...d.data() }))
+        console.log(`📦 prodinfos(global fallback): ${snap3.docs.length}`)
       } catch(e3) { console.warn("prodinfos global:", e3.message) }
     }
 
-    // ── Tentative 4 : products sans filtre (fallback global) ──
-    if (results.length === 0) {
-      try {
-        const snap4 = await db.collection("products").limit(100).get()
-        results = snap4.docs.map(d => ({ id: d.id, ...d.data() }))
-        console.log(`📦 products(global): ${results.length} produits`)
-      } catch(e4) { console.warn("products global:", e4.message) }
-    }
-
-    // Normaliser les champs (les 2 collections ont des noms différents)
+    // ── Normaliser les champs ─────────────────────────────────
     results = results.map(p => ({
-      id:          p.id,
-      name:        p.name        || p.nom        || "Produit",
-      price:       p.price       || p.prix        || 0,
-      description: p.description || p.desc        || "",
-      stock:       p.stock       !== undefined ? p.stock : "N/A",
-      currency:    p.currency    || p.devise      || "€",
+      id:          p.id || String(p.name),
+      name:        p.name        || p.nom   || "Produit",
+      price:       p.price       || p.prix  || 0,
+      description: p.description || p.desc  || "",
+      stock:       p.stock !== undefined ? p.stock : "disponible",
+      currency:    p.currency    || p.devise || "€",
       badge:       p.badge       || "",
       storeUid:    p.storeUid    || storeUid,
+      source:      p.source      || "collection",
     }))
 
-    console.log(`✅ ${results.length} produits chargés pour storeUid=${storeUid || "global"}`)
+    console.log(`✅ TOTAL ${results.length} produits pour storeUid=${storeUid || "global"}`)
     return results
   } catch (e) {
     console.error("❌ Erreur getProduits:", e.message)
