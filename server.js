@@ -1,16 +1,28 @@
 // ===============================================================
-//  server.js — Backend SaaasGenerator + Assistant IA Groq
-//  
-//  Endpoints existants conservés :
-//    POST /create-stripe-session
-//    POST /webhook
-//    GET  /
+//  server.js — Backend COMPLET SaasBuilder + SaaasGenerator
+//  Version fusionnée finale
 //
-//  Nouveaux endpoints IA :
-//    POST /api/assistant          → chat Groq + contexte Firestore
-//    POST /api/save-request       → sauvegarder une requête non résolue
-//    GET  /api/products/:storeUid → liste produits (prodinfos)
-//    GET  /api/orders/:storeUid   → commandes (cmdinfos)
+//  SaasBuilder (abonnements) :
+//    POST /create-billing-session   → abonnement propriétaire
+//    POST /create-connect-account   → Stripe Connect
+//    POST /force-upgrade            → debug upgrade plan
+//
+//  SaaasGenerator (store clients) :
+//    POST /create-stripe-session    → paiement client du store
+//    POST /webhook                  → webhook Stripe (billing + store)
+//
+//  Assistant IA Groq :
+//    POST /api/assistant            → chat Groq + contexte Firestore
+//    POST /api/save-request         → requête non résolue
+//    GET  /api/products/:storeUid   → catalogue produits
+//    GET  /api/orders/:storeUid     → commandes
+//    GET  /api/debug/:storeUid      → diagnostic produits
+//
+//  Variables d'env requises :
+//    STRIPE_SECRET_KEY
+//    STRIPE_WEBHOOK_SECRET
+//    FIREBASE_SERVICE_ACCOUNT     (JSON stringify)
+//    VITE_GROQ_API_KEY            (ou GROQ_API_KEY)
 // ===============================================================
 
 import express    from "express"
@@ -23,11 +35,9 @@ import Groq       from "groq-sdk"
 
 dotenv.config()
 
-// ── App ──────────────────────────────────────────────────────
 const app  = express()
 const PORT = process.env.PORT || 8080
 
-// ── CORS ─────────────────────────────────────────────────────
 app.use(cors({ origin: "*", methods: ["GET", "POST"] }))
 
 // ── Firebase Admin ────────────────────────────────────────────
@@ -35,13 +45,13 @@ let serviceAccount = null
 try {
   serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
 } catch (e) {
-  console.error("❌ Firebase service account JSON invalide")
+  console.error("❌ Firebase service account JSON invalide:", e.message)
 }
 
 if (serviceAccount) {
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) })
 } else {
-  console.error("❌ Firebase NON initialisé")
+  console.error("❌ Firebase NON initialisé — vérifier FIREBASE_SERVICE_ACCOUNT")
 }
 
 const db = admin.firestore()
@@ -50,211 +60,356 @@ const db = admin.firestore()
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY)
 
 // ── Groq ──────────────────────────────────────────────────────
-// Variable d'env : VITE_GROQ_API_KEY ou GROQ_API_KEY
 const groq = new Groq({
-  apiKey: process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY
+  apiKey: process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY || ""
 })
 
-const FRONTEND_URL = "https://musrh.github.io/SaaasGenerator"
+const FRONTEND_BUILDER   = "https://musrh.github.io/SaasBuilder"
+const FRONTEND_GENERATOR = "https://musrh.github.io/SaaasGenerator"
 
-// ── JSON middleware ───────────────────────────────────────────
-app.use(express.json())
 
-// ── Debug ─────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  if (req.path === "/create-stripe-session") {
-    console.log("📦 BODY REÇU =", req.body)
+// ===============================================================
+//  ⚠️  WEBHOOK STRIPE — DOIT ÊTRE AVANT express.json()
+// ===============================================================
+app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"]
+  let event
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET)
+  } catch (err) {
+    console.error("❌ Webhook signature error:", err.message)
+    return res.status(400).send(`Webhook Error: ${err.message}`)
   }
-  next()
+
+  console.log("📨 EVENT TYPE:", event.type)
+
+  if (event.type === "checkout.session.completed") {
+    const session = event.data.object
+    console.log("🎯 SESSION ID:", session.id, "| payment_status:", session.payment_status)
+
+    if (session.payment_status === "paid") {
+
+      // ── Parser metadata (supporte 2 formats) ──────────────
+      // Format 1 (nouveau) : metadata.data = JSON stringifié
+      // Format 2 (ancien)  : metadata.type, .ownerUid directs
+      let metadata = {}
+      try {
+        if (session.metadata?.data) {
+          // Format nouveau : JSON stringifié
+          metadata = JSON.parse(session.metadata.data)
+        } else {
+          // Format ancien : champs directs
+          metadata = { ...session.metadata }
+        }
+        console.log("📦 METADATA final:", JSON.stringify(metadata))
+      } catch (e) {
+        // Fallback : utiliser les champs directs
+        metadata = { ...session.metadata }
+        console.warn("⚠️ Parse metadata JSON échoué, utilisation directe:", metadata)
+      }
+
+      // ── Résoudre l'UID du propriétaire (plusieurs champs possibles) ──
+      // Firestore users a : ownerId, uid, ownerUid, storeId
+      const ownerUid =
+        metadata.ownerUid ||
+        metadata.ownerId  ||
+        metadata.uid      ||
+        metadata.storeId  ||
+        session.client_reference_id || ""
+
+      console.log("🔑 ownerUid résolu:", ownerUid || "⚠️ VIDE!")
+      console.log("📋 type:", metadata.type, "| plan:", metadata.plan)
+
+      // ── ABONNEMENT SAAS BUILDER ──────────────────────────
+      if (metadata.type === "billing") {
+        console.log("✅ Type billing — plan:", metadata.plan, "| uid:", ownerUid)
+
+        // Écrire dans subscriptions
+        try {
+          await db.collection("subscriptions").doc(session.id).set({
+            email:     session.customer_email,
+            plan:      metadata.plan || "pro",
+            ownerUid:  ownerUid,
+            status:    "active",
+            paidAt:    new Date().toISOString(),
+            sessionId: session.id,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          })
+          console.log("✅ Subscription écrite")
+        } catch (e) { console.error("❌ subscription:", e.message) }
+
+        // Mettre à jour le document user (cherche via ownerUid ET ownerId)
+        if (ownerUid) {
+          // Chercher d'abord directement
+          const userRef = db.collection("users").doc(ownerUid)
+          let userSnap  = await userRef.get().catch(() => null)
+
+          // Si pas trouvé par uid direct, chercher par champ ownerId ou uid
+          if (!userSnap?.exists) {
+            try {
+              const q = await db.collection("users")
+                .where("ownerId", "==", ownerUid).limit(1).get()
+              if (!q.empty) {
+                const foundDoc = q.docs[0]
+                await foundDoc.ref.set({
+                  plan:               metadata.plan || "pro",
+                  paye:               true,
+                  subscriptionActive: true,
+                  updatedAt:          Date.now(),
+                }, { merge: true })
+                console.log("🔥 USER PASSÉ EN PRO (via ownerId):", foundDoc.id)
+              } else {
+                // Chercher par champ uid
+                const q2 = await db.collection("users")
+                  .where("uid", "==", ownerUid).limit(1).get()
+                if (!q2.empty) {
+                  await q2.docs[0].ref.set({
+                    plan: metadata.plan || "pro", paye: true,
+                    subscriptionActive: true, updatedAt: Date.now(),
+                  }, { merge: true })
+                  console.log("🔥 USER PASSÉ EN PRO (via uid field):", q2.docs[0].id)
+                } else {
+                  console.error("❌ USER INTROUVABLE pour ownerUid:", ownerUid)
+                }
+              }
+            } catch(eq) { console.error("❌ query user:", eq.message) }
+          } else {
+            // Trouvé directement — mettre à jour
+            try {
+              await userRef.set({
+                plan:               metadata.plan || "pro",
+                paye:               true,
+                subscriptionActive: true,
+                updatedAt:          Date.now(),
+              }, { merge: true })
+              console.log("🔥 USER PASSÉ EN PRO (direct):", ownerUid)
+            } catch (e) { console.error("❌ update user direct:", e.message) }
+          }
+        } else {
+          // ownerUid vide — chercher par email
+          try {
+            const q = await db.collection("users")
+              .where("email", "==", session.customer_email).limit(1).get()
+            if (!q.empty) {
+              await q.docs[0].ref.set({
+                plan: metadata.plan || "pro", paye: true,
+                subscriptionActive: true, updatedAt: Date.now(),
+              }, { merge: true })
+              console.log("🔥 USER PASSÉ EN PRO (via email):", q.docs[0].id)
+            } else {
+              console.error("❌ USER INTROUVABLE via email:", session.customer_email)
+            }
+          } catch(em) { console.error("❌ query by email:", em.message) }
+        }
+      }
+
+      // ── COMMANDE STORE (PAIEMENT CLIENT) ─────────────────
+      if (metadata.type === "store_payment") {
+        try {
+          await db.collection("orders").doc(session.id).set({
+            email:     session.customer_email,
+            items:     metadata.items || [],
+            total:     (session.amount_total || 0) / 100,
+            ownerUid:  metadata.ownerUid,
+            clientId:  metadata.clientId || "",
+            siteSlug:  metadata.siteSlug || "",
+            adresseLivraison: metadata.adresseLivraison || "",
+            status:    "paid",
+            provider:  "stripe",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          })
+          console.log("🛒 COMMANDE STORE OK:", session.id)
+
+          // Aussi dans users/{ownerUid}/orders
+          if (metadata.ownerUid) {
+            try {
+              await db.collection("users").doc(metadata.ownerUid)
+                .collection("orders").add({
+                  email:    session.customer_email,
+                  items:    metadata.items || [],
+                  total:    (session.amount_total || 0) / 100,
+                  ownerUid: metadata.ownerUid,
+                  clientId: metadata.clientId || "",
+                  status:   "paid",
+                  provider: "stripe",
+                  createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                })
+            } catch(e2) { console.warn("users/orders:", e2.message) }
+          }
+        } catch (e) { console.error("❌ commande store:", e.message) }
+      }
+    }
+  }
+
+  res.json({ received: true })
 })
+
+
+// ── JSON middleware (après webhook) ───────────────────────────
+app.use(express.json())
 
 
 // ===============================================================
 //  UTILITAIRES FIRESTORE
 // ===============================================================
 
-// Charger les produits du store depuis TOUTES les sources
-// SOURCE PRINCIPALE : users/{storeUid}/siteData (les vrais produits du store builder)
-// SOURCES SECONDAIRES : prodinfos, products (pour l'assistant AddProduct)
+// Charger les produits depuis toutes les sources disponibles
 const getProduits = async (storeUid) => {
   try {
     let results = []
 
-    // ── SOURCE 1 (PRINCIPALE) : siteData du store ─────────────
-    // Les produits affichés dans le store viennent de siteData.pages[n].sections
+    // Helper : normaliser un doc produit (gère nom/prix/desc et name/price/description)
+    const normalize = (p, src) => ({
+      id:          p.id          || String(p.name || p.nom || ""),
+      name:        p.name        || p.nom         || "Produit",
+      price:       p.price       !== undefined ? p.price : (p.prix !== undefined ? p.prix : 0),
+      description: p.description || p.desc        || "",
+      stock:       p.stock       !== undefined ? p.stock : "disponible",
+      currency:    p.currency    || p.devise       || "€",
+      badge:       p.badge       || "",
+      storeUid:    p.storeUid    || storeUid       || "",
+      source:      src           || "collection",
+    })
+
+    const addIfNew = (raw, src) => {
+      const n = normalize(raw, src)
+      if (n.name && !results.find(r => r.name === n.name)) results.push(n)
+    }
+
+    // ── SOURCE 1 : siteData du store (PRINCIPALE) ─────────────
+    // Les produits affichés dans le store builder viennent de ici
     if (storeUid) {
       try {
         const userDoc = await db.collection("users").doc(storeUid).get()
         if (userDoc.exists) {
           const siteData = userDoc.data().siteData
-          if (siteData?.pages) {
-            for (const page of siteData.pages) {
-              for (const section of (page.sections || [])) {
-                if (section.type === "products" && Array.isArray(section.items)) {
-                  section.items.forEach(p => {
-                    results.push({
-                      id:          String(p.id || p.name),
-                      name:        p.name        || "Produit",
-                      price:       p.price       || 0,
-                      description: p.description || "",
-                      stock:       p.stock       !== undefined ? p.stock : "disponible",
-                      currency:    p.currency    || "€",
-                      badge:       p.badge       || "",
-                      storeUid,
-                      source:      "siteData",
-                    })
-                  })
-                }
+          ;(siteData?.pages || []).forEach(page => {
+            ;(page.sections || []).forEach(section => {
+              if (section.type === "products" && Array.isArray(section.items)) {
+                section.items.forEach(p => addIfNew(p, "siteData"))
               }
-            }
-          }
-          console.log(`📦 siteData(${storeUid}): ${results.length} produits trouvés`)
+            })
+          })
+          console.log(`📦 siteData(${storeUid}): ${results.length} produits`)
         }
-      } catch(e0) { console.warn("siteData read:", e0.message) }
-    }
-
-    // Helper normalisation (appliqué immédiatement à chaque doc)
-    const normalize = (p, src) => ({
-      id:          p.id          || String(p.name || p.nom),
-      name:        p.name        || p.nom   || "Produit",
-      price:       p.price       !== undefined ? p.price : (p.prix !== undefined ? p.prix : 0),
-      description: p.description || p.desc  || "",
-      stock:       p.stock       !== undefined ? p.stock : "disponible",
-      currency:    p.currency    || p.devise || "€",
-      badge:       p.badge       || "",
-      storeUid:    p.storeUid    || storeUid,
-      source:      src || p.source || "collection",
-    })
-
-    // Helper déduplication par name normalisé
-    const addIfNew = (raw, src) => {
-      const n = normalize(raw, src)
-      if (!results.find(r => r.name === n.name)) results.push(n)
+      } catch(e) { console.warn("siteData:", e.message) }
     }
 
     // ── SOURCE 2 : prodinfos filtré par storeUid ──────────────
-    // prodinfos peut avoir nom/prix/desc (ancien format)
     if (storeUid) {
       try {
-        const snap1 = await db.collection("prodinfos")
+        const snap = await db.collection("prodinfos")
           .where("storeUid", "==", storeUid).limit(100).get()
-        snap1.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos"))
-        console.log(`📦 prodinfos(${storeUid}): ${snap1.docs.length} produits`)
-      } catch(e1) { console.warn("prodinfos:", e1.message) }
+        snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos"))
+        console.log(`📦 prodinfos(${storeUid}): ${snap.docs.length} docs`)
+      } catch(e) { console.warn("prodinfos filtré:", e.message) }
     }
 
-    // ── SOURCE 3 : prodinfos SANS filtre storeUid (fallback)───
+    // ── SOURCE 3 : prodinfos GLOBAL (sans filtre storeUid) ────
     // Cas où storeUid n'est pas encore dans prodinfos
     if (results.length === 0) {
       try {
-        const snap1b = await db.collection("prodinfos").limit(100).get()
-        snap1b.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos-global"))
-        console.log(`📦 prodinfos(global): ${snap1b.docs.length} produits`)
-      } catch(e1b) { console.warn("prodinfos global:", e1b.message) }
+        const snap = await db.collection("prodinfos").limit(100).get()
+        snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "prodinfos-global"))
+        console.log(`📦 prodinfos(global): ${snap.docs.length} docs`)
+      } catch(e) { console.warn("prodinfos global:", e.message) }
     }
 
     // ── SOURCE 4 : products filtré par storeUid ───────────────
     if (storeUid) {
       try {
-        const snap2 = await db.collection("products")
+        const snap = await db.collection("products")
           .where("storeUid", "==", storeUid).limit(100).get()
-        snap2.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "products"))
-        console.log(`📦 products(${storeUid}): ${snap2.docs.length} produits`)
-      } catch(e2) { console.warn("products:", e2.message) }
+        snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "products"))
+        console.log(`📦 products(${storeUid}): ${snap.docs.length} docs`)
+      } catch(e) { console.warn("products:", e.message) }
     }
 
-    // ── FALLBACK GLOBAL si toujours vide ──────────────────────
+    // ── SOURCE 5 : products GLOBAL ────────────────────────────
     if (results.length === 0) {
       try {
-        const snap3 = await db.collection("products").limit(50).get()
-        snap3.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "products-global"))
-        console.log(`📦 products(global fallback): ${snap3.docs.length}`)
-      } catch(e3) { console.warn("products global:", e3.message) }
+        const snap = await db.collection("products").limit(50).get()
+        snap.docs.forEach(d => addIfNew({ id: d.id, ...d.data() }, "products-global"))
+        console.log(`📦 products(global): ${snap.docs.length} docs`)
+      } catch(e) { console.warn("products global:", e.message) }
     }
-
-    // Déjà normalisés par addIfNew
 
     console.log(`✅ TOTAL ${results.length} produits pour storeUid=${storeUid || "global"}`)
     return results
   } catch (e) {
-    console.error("❌ Erreur getProduits:", e.message)
+    console.error("❌ getProduits:", e.message)
     return []
   }
 }
 
-// Chercher les commandes client (collection cmdinfos ET orders)
+
+// Charger les commandes (cmdinfos + orders)
 const getCmdinfos = async (storeUid, { nom, email, date } = {}) => {
   try {
     let results = []
 
-    // ── Chercher dans cmdinfos ─────────────────────────────
-    try {
-      let q = db.collection("cmdinfos")
-      // Filtrer par email si fourni (index requis)
-      if (email) q = q.where("customerEmail", "==", email.trim().toLowerCase())
-      else if (storeUid) q = q.where("storeUid", "==", storeUid)
-      const snap = await q.limit(20).get()
-      results = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      console.log(`📋 cmdinfos: ${results.length} commandes`)
-    } catch(e) { console.warn("cmdinfos query:", e.message) }
-
-    // ── Fallback : chercher dans orders (collection racine) ─
-    if (results.length === 0) {
+    // cmdinfos par storeUid
+    if (storeUid) {
       try {
-        let q2 = db.collection("orders")
-        if (email) q2 = q2.where("email", "==", email.trim().toLowerCase())
-        else if (storeUid) q2 = q2.where("clientId", "==", storeUid)
-        const snap2 = await q2.limit(20).get()
-        const r2 = snap2.docs.map(d => ({
+        let q = db.collection("cmdinfos")
+        if (email) q = q.where("clientEmail", "==", email.trim().toLowerCase())
+        else if (nom) q = q.where("customerName", "==", nom)
+        else q = q.where("storeUid", "==", storeUid)
+        const snap = await q.limit(20).get()
+        results = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        console.log(`📋 cmdinfos: ${results.length}`)
+      } catch(e) { console.warn("cmdinfos:", e.message) }
+    }
+
+    // orders par clientId ou email
+    if (!results.length) {
+      try {
+        let q = db.collection("orders")
+        if (email) q = q.where("customerEmail", "==", email.trim().toLowerCase())
+        else if (storeUid) q = q.where("ownerUid", "==", storeUid)
+        const snap = await q.limit(20).get()
+        results = [...results, ...snap.docs.map(d => ({
           id: d.id, ...d.data(),
           customerName:  d.data().customerName  || d.data().name || "",
           customerEmail: d.data().customerEmail || d.data().email || "",
-        }))
-        results = [...results, ...r2]
-        console.log(`📋 orders (fallback): ${r2.length} commandes`)
-      } catch(e) { console.warn("orders fallback query:", e.message) }
+        }))]
+        console.log(`📋 orders: ${results.length}`)
+      } catch(e) { console.warn("orders fallback:", e.message) }
     }
 
-    // ── Chercher aussi dans users/{storeUid}/orders ─────────
+    // users/{storeUid}/orders
     if (storeUid) {
       try {
-        let q3 = db.collection("users").doc(storeUid).collection("orders")
-        if (email) q3 = q3.where("customerEmail", "==", email.trim().toLowerCase())
-        const snap3 = await q3.limit(20).get()
-        const r3 = snap3.docs.map(d => ({ id: d.id, ...d.data() }))
-        // Dédupliquer
-        const existingIds = new Set(results.map(r => r.id))
-        results = [...results, ...r3.filter(r => !existingIds.has(r.id))]
-        console.log(`📋 users/orders: ${r3.length} commandes`)
-      } catch(e) { console.warn("users/orders query:", e.message) }
+        let q = db.collection("users").doc(storeUid).collection("orders")
+        if (email) q = q.where("customerEmail", "==", email.trim().toLowerCase())
+        const snap = await q.limit(20).get()
+        const ids  = new Set(results.map(r => r.id))
+        snap.docs.filter(d => !ids.has(d.id)).forEach(d =>
+          results.push({ id: d.id, ...d.data() })
+        )
+      } catch(e) { console.warn("users/orders:", e.message) }
     }
 
-    // ── Filtres client ─────────────────────────────────────
-    if (nom) {
-      const n = nom.toLowerCase()
-      results = results.filter(r =>
-        (r.customerName || r.name || "").toLowerCase().includes(n)
-      )
-    }
-    if (date) {
-      results = results.filter(r => {
-        const d = r.createdAt?.toDate?.()?.toISOString?.() || String(r.createdAt || "")
-        return d.includes(date)
-      })
-    }
-    console.log(`📋 Total commandes trouvées: ${results.length}`)
+    // Filtres
+    if (nom)  results = results.filter(r => (r.customerName||"").toLowerCase().includes(nom.toLowerCase()))
+    if (date) results = results.filter(r => String(r.createdAt||"").includes(date))
+    if (email) results = results.filter(r =>
+      (r.customerEmail||r.email||"").toLowerCase() === email.trim().toLowerCase()
+    )
+
     return results
-  } catch (e) {
-    console.error("❌ Erreur getCmdinfos:", e.message)
+  } catch(e) {
+    console.error("❌ getCmdinfos:", e.message)
     return []
   }
 }
 
-// Sauvegarder une requête non résolue (collection requetes)
+
+// Sauvegarder une requête non résolue
 const saveRequete = async (storeUid, data) => {
   try {
     const ref = await db.collection("requetes").add({
-      storeUid:  storeUid || "unknown",
+      storeUid:  storeUid  || "unknown",
       nom:       data.nom       || "",
       email:     data.email     || "",
       telephone: data.telephone || "",
@@ -263,112 +418,109 @@ const saveRequete = async (storeUid, data) => {
       status:    "nouveau",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     })
-    console.log("✅ Requête sauvegardée:", ref.id)
     return ref.id
   } catch (e) {
-    console.error("❌ Erreur save requete:", e.message)
+    console.error("❌ saveRequete:", e.message)
     return null
   }
 }
 
-// Construire le contexte produits pour le prompt
+
+// Construire le contexte produits pour le prompt Groq
 const buildProduitsContext = (produits) => {
-  if (!produits.length) return "Aucun produit disponible dans le catalogue du store."
+  if (!produits.length) return "Aucun produit disponible dans le catalogue."
   return produits.map(p => {
-    const name  = p.name || p.nom || "Produit sans nom"
-    const price = p.price || p.prix
-    const priceFmt = price !== undefined && price !== null ? `${price}${p.currency || p.devise || "€"}` : "prix non défini"
+    const price = p.price !== undefined && p.price !== null ? p.price : p.prix
+    const priceFmt = price !== undefined && price !== null
+      ? `${price}${p.currency || p.devise || "€"}`
+      : "prix non défini"
     const desc  = p.description || p.desc || ""
-    const stock = p.stock !== undefined ? `stock: ${p.stock}` : ""
     const badge = p.badge ? `[${p.badge}]` : ""
-    return `- ${name} ${badge} | Prix: ${priceFmt} | ${desc}${stock ? " | " + stock : ""}`
+    const stock = p.stock !== undefined && p.stock !== "disponible" ? ` | stock: ${p.stock}` : ""
+    return `- ${p.name || p.nom} ${badge} | Prix: ${priceFmt}${desc ? " | " + desc : ""}${stock}`
   }).join("\n")
 }
 
-// Construire le contexte commandes pour le prompt
+
+// Construire le contexte commandes pour le prompt Groq
 const buildCmdContext = (cmds) => {
-  if (!cmds.length) return "Aucune commande trouvée avec ces informations."
+  if (!cmds.length) return "Aucune commande trouvée."
+  const statuts = {
+    pending:      "En attente",
+    paid:         "Payée — en cours de traitement",
+    shipped:      "Expédiée",
+    delivered:    "Livrée",
+    cancelled:    "Annulée",
+    info_needed:  "Renseignements requis",
+  }
   return cmds.map(c => {
-    const statuts = {
-      pending:   "En attente",
-      paid:      "Payée — en cours de traitement",
-      shipped:   "Expédiée — en route",
-      delivered: "Livrée",
-      cancelled: "Annulée",
-      returned:  "Retour client",
-      info_needed: "Renseignements supplémentaires requis",
-    }
-    const statut  = statuts[c.status] || c.status || "Inconnu"
-    const date    = c.createdAt?.toDate?.()?.toLocaleDateString("fr-FR") || c.createdAt || "N/A"
-    const items   = (c.items || []).map(i => `${i.name || i.nom} ×${i.qty || 1}`).join(", ")
-    return `Commande #${c.id.slice(0,8).toUpperCase()} | Date: ${date} | Articles: ${items} | Total: ${c.total || c.montant || "N/A"}€ | Statut: ${statut} | Adresse: ${c.customerAddress || c.adresse || "non renseignée"}`
+    const statut = statuts[c.status] || c.status || "Inconnu"
+    const date   = c.createdAt?.toDate?.()?.toLocaleDateString("fr-FR") || c.createdAt || "N/A"
+    const items  = (c.items || []).map(i => `${i.name || i.nom} ×${i.qty || 1}`).join(", ")
+    return `Commande #${(c.id||"").slice(0,8).toUpperCase()} | Date: ${date} | Articles: ${items || "N/A"} | Total: ${c.total || c.montant || "N/A"}€ | Statut: ${statut} | Livraison: ${c.customerAddress || c.adresseLivraison || "non renseignée"}`
   }).join("\n")
 }
 
 
 // ===============================================================
-//  ENDPOINT : POST /api/assistant
-//  Chat avec l'assistant IA Groq
+//  POST /api/assistant — Chat Groq + contexte Firestore
 // ===============================================================
 app.post("/api/assistant", async (req, res) => {
   const {
-    message,        // message du client
-    history = [],   // historique de la conversation [ {role, content} ]
-    storeUid,       // uid du propriétaire du store
-    storeEmail,     // email du store (pour fallback)
-    storeName,      // nom du store
-    lang = "fr",    // langue
-    clientInfo = {} // { nom, email, date } si déjà renseigné
+    message,
+    history    = [],
+    storeUid,
+    storeEmail,
+    storeName,
+    lang       = "fr",
+    clientInfo = {}
   } = req.body
 
   if (!message) return res.status(400).json({ error: "message requis" })
 
   try {
-    // ── 1. Charger le contexte Firestore ───────────────────────
-    console.log(`🤖 Assistant appelé | storeUid=${storeUid} | lang=${lang} | msg="${message.slice(0,50)}"`)
+    console.log(`🤖 Assistant | storeUid=${storeUid} | lang=${lang} | msg="${message.slice(0,60)}"`)
+
     const [produits, cmds] = await Promise.all([
       getProduits(storeUid),
       (clientInfo.email || clientInfo.nom)
         ? getCmdinfos(storeUid, clientInfo)
-        : Promise.resolve([])
+        : Promise.resolve([]),
     ])
     console.log(`📊 Contexte: ${produits.length} produits, ${cmds.length} commandes`)
 
     const produitsCtx = buildProduitsContext(produits)
     const cmdsCtx     = cmds.length ? buildCmdContext(cmds) : ""
 
-    // ── 2. System prompt ───────────────────────────────────────
+    const langLabel = { fr: "français", ar: "arabe", es: "espagnol", en: "anglais" }[lang] || "français"
+
     const systemPrompt = `
-Tu es l'assistant vocal IA du store "${storeName || "notre boutique"}".
-Tu aides les clients par téléphone ou chat. Tu parles en ${lang === "fr" ? "français" : lang === "ar" ? "arabe" : lang === "es" ? "espagnol" : "anglais"}.
-Sois chaleureux, professionnel et concis.
+Tu es l'assistant IA du store "${storeName || "notre boutique"}".
+Tu aides les clients. Tu réponds en ${langLabel}. Sois chaleureux, professionnel et concis.
 
 === CATALOGUE PRODUITS ===
 ${produitsCtx}
 
 === COMMANDES DU CLIENT ===
-${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite-le à fournir son nom, email et date de commande."}
+${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite-le à fournir son email et sa date de commande."}
 
-=== RÈGLES IMPORTANTES ===
+=== RÈGLES ===
 1. Pour les PRODUITS : informe sur prix, description, disponibilité depuis le catalogue ci-dessus.
-2. Pour les COMMANDES : demande d'abord nom + email + date de commande si pas fournis.
-3. Si tu ne trouves PAS la réponse : réponds exactement cette phrase JSON :
-   {"action":"SHOW_REQUEST_FORM","reason":"[raison précise]"}
+2. Pour les COMMANDES : demande nom + email + date si pas fournis.
+3. Si tu ne trouves PAS la réponse : réponds exactement :
+   {"action":"SHOW_REQUEST_FORM","reason":"[raison]"}
 4. Pour sauvegarder une requête : réponds exactement :
    {"action":"SAVE_REQUEST","data":{"nom":"...","email":"...","telephone":"...","question":"..."}}
-5. Ne jamais inventer des prix ou informations produits absents du catalogue.
-6. Email du store pour contact direct : ${storeEmail || "contact@store.com"}
-7. Statuts commandes : en attente | payée | expédiée | livrée | annulée | retour | renseignements requis
+5. Ne jamais inventer des prix ou informations absents du catalogue.
+6. Email du store : ${storeEmail || "contactez-nous via le formulaire"}
 `.trim()
 
-    // ── 3. Construire les messages pour Groq ───────────────────
     const messages = [
-      { role: "system",    content: systemPrompt },
-      ...history.slice(-8), // Garder les 8 derniers échanges
-      { role: "user",      content: message }
+      { role: "system", content: systemPrompt },
+      ...history.slice(-8),
+      { role: "user",   content: message },
     ]
 
-    // ── 4. Appel Groq ──────────────────────────────────────────
     const completion = await groq.chat.completions.create({
       model:       "llama-3.3-70b-versatile",
       messages,
@@ -378,73 +530,66 @@ ${cmdsCtx || "Aucune commande chargée. Si le client demande sa commande, invite
 
     const reply = completion.choices[0]?.message?.content?.trim() || ""
 
-    // ── 5. Détecter les actions spéciales ─────────────────────
-    let action      = null
-    let actionData  = null
-    let cleanReply  = reply
-
-    // Détecter JSON action dans la réponse
-    const jsonMatch = reply.match(/\{[\s\S]*"action"[\s\S]*\}/)
+    // Détecter actions JSON
+    let action = null, actionData = null, cleanReply = reply
+    const jsonMatch = reply.match(/\{[\s\S]*?"action"[\s\S]*?\}/)
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0])
         action     = parsed.action
         actionData = parsed.data || { reason: parsed.reason }
-        // Remplacer le JSON par un message naturel
         cleanReply = reply.replace(jsonMatch[0], "").trim()
         if (!cleanReply) {
-          if (action === "SHOW_REQUEST_FORM") {
-            const msgs = {
-              fr: `Je ne trouve pas la réponse à votre question dans notre système. Permettez-moi de noter vos coordonnées pour qu'un conseiller vous rappelle.`,
-              en: `I can't find the answer in our system. Let me take your details so an advisor can call you back.`,
-              es: `No encuentro la respuesta en nuestro sistema. Déjame anotar sus datos para que un asesor le llame.`,
-              ar: `لم أجد إجابة في نظامنا. دعني أسجّل بياناتك ليتصل بك أحد مستشارينا.`,
-            }
-            cleanReply = msgs[lang] || msgs.fr
+          const fallbacks = {
+            fr: "Je ne trouve pas la réponse dans notre système. Laissez-moi noter vos coordonnées pour qu'un conseiller vous rappelle.",
+            en: "I can't find the answer. Let me take your details so an advisor can call you back.",
+            ar: "لم أجد الإجابة. دعني أسجل معلوماتك لكي يتصل بك أحد المستشارين.",
+            es: "No encuentro la respuesta. Déjame tomar tus datos para que un asesor te llame.",
           }
+          cleanReply = fallbacks[lang] || fallbacks.fr
         }
-      } catch(e) { /* pas un JSON valide, ignorer */ }
+      } catch(e) { /* JSON invalide, garder reply brut */ }
     }
 
-    // ── 6. Réponse ─────────────────────────────────────────────
+    // Sauvegarder requête si demandé
+    if (action === "SAVE_REQUEST" && actionData) {
+      await saveRequete(storeUid, actionData)
+    }
+
     res.json({
-      reply:      cleanReply,
+      reply:      cleanReply || reply,
       action,
       actionData,
-      model:      "llama-3.3-70b-versatile",
-      productsFound: produits.length,
-      ordersFound:   cmds.length,
+      debug: {
+        produitsCount: produits.length,
+        cmdsCount:     cmds.length,
+        storeUid,
+      }
     })
 
   } catch (e) {
-    console.error("❌ Groq assistant error:", e.message)
-    res.status(500).json({ error: "Erreur assistant IA", details: e.message })
+    console.error("❌ /api/assistant:", e.message)
+    res.status(500).json({ error: "Erreur assistant: " + e.message })
   }
 })
 
 
 // ===============================================================
-//  ENDPOINT : POST /api/save-request
-//  Sauvegarder une requête non résolue dans Firestore
+//  POST /api/save-request — Sauvegarder requête non résolue
 // ===============================================================
 app.post("/api/save-request", async (req, res) => {
   const { storeUid, nom, email, telephone, adresse, question } = req.body
-
-  if (!question) return res.status(400).json({ error: "question requise" })
-
   try {
     const id = await saveRequete(storeUid, { nom, email, telephone, adresse, question })
-    res.json({ success: true, id, message: "Requête enregistrée avec succès" })
+    res.json({ ok: true, id })
   } catch (e) {
-    res.status(500).json({ error: "Erreur sauvegarde requête", details: e.message })
+    res.status(500).json({ error: e.message })
   }
 })
 
 
 // ===============================================================
-//  ENDPOINT : GET /api/debug/:storeUid — Diagnostic assistant
-//  Voir exactement ce que l'assistant trouve comme produits
-//  Usage : GET https://backend.../api/debug/tHORgU4qynaDjQRh...
+//  GET /api/debug/:storeUid — Diagnostic assistant
 // ===============================================================
 app.get("/api/debug/:storeUid", async (req, res) => {
   const { storeUid } = req.params
@@ -452,21 +597,16 @@ app.get("/api/debug/:storeUid", async (req, res) => {
     const produits = await getProduits(storeUid)
     res.json({
       storeUid,
-      count:    produits.length,
-      produits: produits.map(p => ({
-        name:   p.name,
-        price:  p.price,
-        desc:   p.description,
-        source: p.source,
-      })),
+      count:         produits.length,
+      produits:      produits.map(p => ({ name: p.name, price: p.price, source: p.source })),
       promptInjecte: buildProduitsContext(produits),
     })
   } catch(e) { res.status(500).json({ error: e.message }) }
 })
 
+
 // ===============================================================
-//  ENDPOINT : GET /api/products/:storeUid
-//  Retourner les produits d'un store (pour debug / frontend)
+//  GET /api/products/:storeUid
 // ===============================================================
 app.get("/api/products/:storeUid", async (req, res) => {
   const produits = await getProduits(req.params.storeUid)
@@ -475,8 +615,7 @@ app.get("/api/products/:storeUid", async (req, res) => {
 
 
 // ===============================================================
-//  ENDPOINT : GET /api/orders/:storeUid
-//  Retourner les commandes d'un store
+//  GET /api/orders/:storeUid
 // ===============================================================
 app.get("/api/orders/:storeUid", async (req, res) => {
   const { email, nom, date } = req.query
@@ -486,71 +625,21 @@ app.get("/api/orders/:storeUid", async (req, res) => {
 
 
 // ===============================================================
-//  WEBHOOK STRIPE (existant — conservé intact)
+//  POST /create-stripe-session — Paiement client du store
 // ===============================================================
-app.post(
-  "/webhook",
-  bodyParser.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"]
-    let event
-    try {
-      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET)
-    } catch (err) {
-      console.error("❌ Webhook error:", err.message)
-      return res.status(400).send(`Webhook Error: ${err.message}`)
-    }
-
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object
-      console.log("💰 PAYMENT SUCCESS:", session.id)
-
-      if (session.payment_status === "paid") {
-        try {
-          const existing = await db.collection("orders").where("sessionId", "==", session.id).get()
-          if (!existing.empty) { console.log("⚠️ Order déjà existante"); return res.json({ received: true }) }
-
-          let metadata = {}
-          try { metadata = session.metadata?.data ? JSON.parse(session.metadata.data) : {} } catch(e) {}
-
-          const uid = metadata.clientId || "master"
-          await db.collection("orders").doc(session.id).set({
-            email: session.customer_email || metadata.email || "",
-            items: metadata.items || [],
-            montant: (session.amount_total || 0) / 100,
-            adresse: metadata.adresseLivraison || "",
-            clientId: uid,
-            plan: metadata.plan || "basic",
-            paymentMethod: "stripe",
-            sessionId: session.id,
-            status: "paid",
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          })
-          await db.collection("sites").doc(uid).set({
-            userId: uid,
-            plan: metadata.plan || "premium",
-            sections: [{ type: "hero", title: "Bienvenue" }, { type: "text", content: "Mon site SaaS" }],
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          }, { merge: true })
-          console.log("✅ ORDER + SITE OK:", session.id)
-        } catch (err) { console.error("❌ Webhook processing error:", err) }
-      }
-    }
-    res.json({ received: true })
-  }
-)
-
-
-// ===============================================================
-//  CREATE STRIPE SESSION (existant — conservé intact)
-// ===============================================================
-app.post("/create-stripe-session", async (req, res) => {
+app.post("/create-store-session", async (req, res) => {
   try {
-    let { items, email, adresseLivraison, clientId, plan, successUrl, cancelUrl } = req.body
+    let {
+      items, email, adresseLivraison, clientId,
+      siteSlug, ownerUid, plan, storeName,
+      successUrl, cancelUrl, currency, description,
+    } = req.body
+
+    console.log("📦 create-stripe-session — items:", items?.length, "| email:", email)
 
     items = (items || []).map(item => ({
-      nom:      item.nom      || item.title || "Produit",
-      prix:     item.prix     || item.price || 0,
+      nom:      item.nom      || item.name  || item.title || "Produit",
+      prix:     parseFloat(item.prix || item.price || item.unit_amount || 0),
       quantity: item.quantity || item.qty   || 1,
     }))
 
@@ -561,22 +650,26 @@ app.post("/create-stripe-session", async (req, res) => {
       customer_email: email || undefined,
       line_items: items.map(item => ({
         price_data: {
-          currency: "eur",
+          currency:     currency || "eur",
           product_data: { name: item.nom },
-          unit_amount: Math.round(item.prix * 100),
+          unit_amount:  Math.round(item.prix * 100),
         },
         quantity: item.quantity,
       })),
       mode: "payment",
-      success_url: successUrl || `${FRONTEND_URL}/`,
-      cancel_url:  cancelUrl  || `${FRONTEND_URL}/`,
+      success_url: successUrl || `${FRONTEND_GENERATOR}/`,
+      cancel_url:  cancelUrl  || `${FRONTEND_GENERATOR}/`,
       metadata: {
         data: JSON.stringify({
+          type:             "store_payment",
           items,
           adresseLivraison: adresseLivraison || "",
-          email:    email    || "",
-          clientId: clientId || "master",
-          plan:     plan     || "basic",
+          email:            email            || "",
+          clientId:         clientId         || ownerUid || "",
+          siteSlug:         siteSlug         || "",
+          ownerUid:         ownerUid         || clientId || "",
+          plan:             plan             || "basic",
+          storeName:        storeName        || "",
         }),
       },
     })
@@ -585,29 +678,171 @@ app.post("/create-stripe-session", async (req, res) => {
     res.json({ url: session.url })
 
   } catch (err) {
-    console.error("❌ Stripe session error:", err)
+    console.error("❌ create-stripe-session:", err.message)
     res.status(500).json({ error: "Stripe session failed", details: err.message })
   }
 })
 
 
 // ===============================================================
-//  HEALTH CHECK
+//  POST /create-billing-session — Abonnement SaasBuilder
+// ===============================================================
+app.post("/create-billing-session", async (req, res) => {
+  try {
+    const { email, plan, ownerUid } = req.body
+    if (!ownerUid) return res.status(400).json({ error: "ownerUid requis" })
+
+    const prices = { basic: 500, pro: 1500, premium: 2900 }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      customer_email: email,
+      line_items: [{
+        price_data: {
+          currency: "eur",
+          product_data: { name: `Abonnement ${plan || "pro"}` },
+          unit_amount: prices[plan] || 1500,
+        },
+        quantity: 1,
+      }],
+      mode: "payment",
+      success_url: `${FRONTEND_BUILDER}/#/dashboard?success=true`,
+      cancel_url:  `${FRONTEND_BUILDER}/#/dashboard`,
+      metadata: {
+        // Format JSON stringifié (nouveau standard)
+        data: JSON.stringify({
+          type:     "billing",
+          plan:     plan      || "pro",
+          ownerUid: ownerUid,
+          ownerId:  ownerUid,   // compat champ Firestore ownerId
+          uid:      ownerUid,   // compat champ Firestore uid
+        }),
+        // Champs directs en backup (ancien format)
+        type:     "billing",
+        ownerUid: ownerUid,
+        ownerId:  ownerUid,
+        plan:     plan || "pro",
+      },
+    })
+
+    res.json({ url: session.url })
+  } catch (err) {
+    console.error("❌ create-billing-session:", err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+
+// ===============================================================
+//  POST /force-upgrade — Debug : forcer upgrade plan (test)
+// ===============================================================
+app.post("/force-upgrade", async (req, res) => {
+  const { ownerUid, ownerId, uid, email, plan } = req.body
+  // Accepter n'importe quel champ UID
+  const targetUid = ownerUid || ownerId || uid
+  const targetPlan = plan || "pro"
+
+  if (!targetUid && !email) return res.status(400).json({ error: "ownerUid ou email requis" })
+
+  try {
+    const update = { plan: targetPlan, paye: true, subscriptionActive: true, updatedAt: Date.now() }
+
+    if (targetUid) {
+      // 1. Essai direct par document ID
+      const ref  = db.collection("users").doc(targetUid)
+      const snap = await ref.get()
+
+      if (snap.exists) {
+        await ref.set(update, { merge: true })
+        console.log("✅ force-upgrade OK (direct):", targetUid, "→", targetPlan)
+        return res.json({ ok: true, method: "direct", uid: targetUid, plan: targetPlan })
+      }
+
+      // 2. Chercher par champ ownerId
+      const q1 = await db.collection("users").where("ownerId", "==", targetUid).limit(1).get()
+      if (!q1.empty) {
+        await q1.docs[0].ref.set(update, { merge: true })
+        return res.json({ ok: true, method: "ownerId", uid: q1.docs[0].id, plan: targetPlan })
+      }
+
+      // 3. Chercher par champ uid
+      const q2 = await db.collection("users").where("uid", "==", targetUid).limit(1).get()
+      if (!q2.empty) {
+        await q2.docs[0].ref.set(update, { merge: true })
+        return res.json({ ok: true, method: "uid-field", uid: q2.docs[0].id, plan: targetPlan })
+      }
+    }
+
+    // 4. Chercher par email
+    if (email) {
+      const qe = await db.collection("users").where("email", "==", email).limit(1).get()
+      if (!qe.empty) {
+        await qe.docs[0].ref.set(update, { merge: true })
+        return res.json({ ok: true, method: "email", uid: qe.docs[0].id, plan: targetPlan })
+      }
+    }
+
+    return res.status(404).json({ error: "Utilisateur introuvable", targetUid, email })
+  } catch (err) {
+    console.error("❌ force-upgrade:", err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+
+// ===============================================================
+//  POST /create-connect-account — Stripe Connect
+// ===============================================================
+app.post("/create-connect-account", async (req, res) => {
+  try {
+    const { ownerUid, email } = req.body
+    const userRef = db.collection("users").doc(ownerUid)
+    const userDoc = await userRef.get()
+    let accountId = userDoc.exists && userDoc.data().stripeAccountId
+      ? userDoc.data().stripeAccountId
+      : null
+
+    if (!accountId) {
+      const account = await stripe.accounts.create({ type: "express", email })
+      accountId = account.id
+      await userRef.set({ stripeAccountId: accountId }, { merge: true })
+    }
+
+    const link = await stripe.accountLinks.create({
+      account:     accountId,
+      refresh_url: `${FRONTEND_BUILDER}/#/reauth`,
+      return_url:  `${FRONTEND_BUILDER}/#/dashboard`,
+      type:        "account_onboarding",
+    })
+
+    res.json({ url: link.url })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+
+// ===============================================================
+//  GET / — Health check
 // ===============================================================
 app.get("/", (req, res) => {
   res.json({
     status:   "OK",
-    service:  "SaaasGenerator Backend + Groq AI",
-    groq:     !!process.env.VITE_GROQ_API_KEY ? "configuré" : "❌ clé manquante",
-    firebase: serviceAccount ? "configuré" : "❌ non configuré",
-    frontend: FRONTEND_URL,
+    service:  "SaasBuilder + SaaasGenerator Backend",
+    groq:     process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅ configuré" : "❌ clé manquante",
+    firebase: serviceAccount ? "✅ configuré" : "❌ non configuré",
+    stripe:   process.env.STRIPE_SECRET_KEY ? "✅ configuré" : "❌ clé manquante",
     endpoints: [
+      "POST /create-billing-session",
+      "POST /create-stripe-session",
+      "POST /create-connect-account",
+      "POST /force-upgrade",
+      "POST /webhook",
       "POST /api/assistant",
       "POST /api/save-request",
       "GET  /api/products/:storeUid",
       "GET  /api/orders/:storeUid",
-      "POST /create-stripe-session",
-      "POST /webhook",
+      "GET  /api/debug/:storeUid",
     ]
   })
 })
@@ -618,6 +853,7 @@ app.get("/", (req, res) => {
 // ===============================================================
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on port ${PORT}`)
-  console.log(`🤖 Groq AI: ${process.env.VITE_GROQ_API_KEY ? "✅ prêt" : "❌ clé manquante (VITE_GROQ_API_KEY)"}`)
-  console.log(`🔥 Firebase: ${serviceAccount ? "✅ prêt" : "❌ non configuré"}`)
+  console.log(`🤖 Groq:     ${process.env.VITE_GROQ_API_KEY || process.env.GROQ_API_KEY ? "✅" : "❌ VITE_GROQ_API_KEY manquant"}`)
+  console.log(`🔥 Firebase: ${serviceAccount ? "✅" : "❌ FIREBASE_SERVICE_ACCOUNT manquant"}`)
+  console.log(`💳 Stripe:   ${process.env.STRIPE_SECRET_KEY ? "✅" : "❌ STRIPE_SECRET_KEY manquant"}`)
 })
