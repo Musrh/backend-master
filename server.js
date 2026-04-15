@@ -248,6 +248,67 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
 // ── JSON middleware (après webhook) ───────────────────────────
 app.use(express.json())
 
+//début de test paiement plan free
+
+
+// ===============================================================
+//  POST /create-free-test-session — TEST paiement plan FREE
+// ===============================================================
+app.post("/create-free-test-session", async (req, res) => {
+  try {
+    const { ownerUid, email } = req.body
+
+    if (!ownerUid) {
+      return res.status(400).json({ error: "ownerUid requis" })
+    }
+
+    console.log("🧪 FREE TEST session pour:", ownerUid)
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      customer_email: email || undefined,
+
+      line_items: [{
+        price_data: {
+          currency: "eur",
+          product_data: {
+            name: "Test Plan FREE",
+          },
+          unit_amount: 100, // 🔥 1€ (recommandé)
+        },
+        quantity: 1,
+      }],
+
+      mode: "payment",
+
+      success_url: `${FRONTEND_BUILDER}/#/dashboard?freeTest=true`,
+      cancel_url:  `${FRONTEND_BUILDER}/#/dashboard`,
+
+      metadata: {
+        data: JSON.stringify({
+          type: "free_test",   // 🔥 IMPORTANT
+          plan: "free",
+          ownerUid: ownerUid,
+          ownerId: ownerUid,
+          uid: ownerUid,
+        }),
+        // fallback (comme ton billing)
+        type: "free_test",
+        ownerUid: ownerUid,
+        plan: "free",
+      },
+    })
+
+    res.json({ url: session.url })
+
+  } catch (err) {
+    console.error("❌ create-free-test-session:", err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+
+//fin test paiement frer
 
 // ===============================================================
 //  UTILITAIRES FIRESTORE
