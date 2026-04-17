@@ -206,7 +206,7 @@ app.post("/webhook", bodyParser.raw({ type: "application/json" }), async (req, r
       // ── COMMANDE STORE (PAIEMENT CLIENT) ─────────────────
       if (metadata.type === "store_payment") {
         try {
-          await db.collection("orders").doc(session.id).set({
+          await db.collection("orderstest").doc(session.id).set({
             email:     session.customer_email,
             items:     metadata.items || [],
             total:     (session.amount_total || 0) / 100,
